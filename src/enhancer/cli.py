@@ -67,6 +67,31 @@ def cmd_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_search(args: argparse.Namespace) -> int:
+    from .sources import search
+
+    results = search(args.query, limit=args.limit)
+    if not results:
+        print("No results.")
+        return 1
+    for i, r in enumerate(results, 1):
+        print(f"{i:2d}. {r.title[:60]:60s}  {r.duration_hms:>9s}  {r.uploader[:24]}")
+        print(f"    {r.url}")
+    return 0
+
+
+def cmd_fetch(args: argparse.Namespace) -> int:
+    from .sources import download
+
+    def progress(done: int, total: int) -> None:
+        if total:
+            print(f"\r{done * 100 // total}%", end="", flush=True)
+
+    path = download(args.url, args.dir, on_progress=progress)
+    print(f"\nSaved to {path}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     parser = argparse.ArgumentParser(prog="enhancer")
@@ -94,6 +119,16 @@ def main(argv: list[str] | None = None) -> int:
     m = sub.add_parser("models", help="list drop-in weights")
     m.add_argument("--dir", default="models/custom")
     m.set_defaults(func=cmd_models)
+
+    s = sub.add_parser("search", help="search YouTube")
+    s.add_argument("query")
+    s.add_argument("--limit", type=int, default=10)
+    s.set_defaults(func=cmd_search)
+
+    f = sub.add_parser("fetch", help="download a YouTube video")
+    f.add_argument("url")
+    f.add_argument("--dir", default="downloads")
+    f.set_defaults(func=cmd_fetch)
 
     args = parser.parse_args(argv)
     return args.func(args)
