@@ -68,6 +68,12 @@ class Upscaler:
         )
         self.cpu_fallback_count = 0
 
+    @property
+    def scale(self) -> int:
+        """The model's scale factor, exposed directly for callers such as
+        render_resumable that need it without reaching through to the model."""
+        return self.model.scale
+
     def _infer(self, patch: torch.Tensor) -> torch.Tensor:
         if self.half:
             patch = patch.half()

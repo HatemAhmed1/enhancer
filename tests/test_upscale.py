@@ -59,6 +59,15 @@ def test_upscaler_output_dtype_is_uint8(rng):
     assert up.process(frame).dtype == np.uint8
 
 
+def test_upscaler_exposes_model_scale():
+    """render_resumable and other callers read upscaler.scale directly;
+
+    it must not be necessary to reach through to upscaler.model.scale.
+    """
+    up = Upscaler(FakeModel(scale=4), tile=16, overlap=4, device="cpu")
+    assert up.scale == 4
+
+
 def test_falls_back_to_cpu_when_tile_floor_reached(rng, monkeypatch):
     frame = rng.integers(0, 256, (32, 32, 3), dtype=np.uint8)
     model = FakeModel(scale=2)
