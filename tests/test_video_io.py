@@ -132,3 +132,40 @@ def test_decoder_start_and_max_select_a_window(synthetic_clip):
 def test_decoder_start_frame_zero_matches_no_seek(synthetic_clip):
     p = SourceProfile.probe(synthetic_clip)
     assert len(list(Decoder(p, start_frame=0).frames())) == 50
+
+
+def test_decoder_accepts_a_filter_chain(synthetic_clip):
+    p = SourceProfile.probe(synthetic_clip)
+    frames = list(Decoder(p, video_filter="hqdn3d=4:3:6:4").frames())
+    assert len(frames) == 50
+    assert frames[0].shape == (240, 320, 3)
+
+
+def test_filtered_output_differs_from_unfiltered(synthetic_clip):
+    p = SourceProfile.probe(synthetic_clip)
+    plain = list(Decoder(p).frames())[0]
+    blurred = list(Decoder(p, video_filter="boxblur=4").frames())[0]
+    assert not np.array_equal(plain, blurred)
+
+
+def test_empty_filter_chain_is_equivalent_to_none(synthetic_clip):
+    p = SourceProfile.probe(synthetic_clip)
+    a = list(Decoder(p, video_filter="").frames())
+    b = list(Decoder(p).frames())
+    assert len(a) == len(b)
+    assert np.array_equal(a[0], b[0])
+
+
+def test_decimating_filter_reduces_frame_count(synthetic_clip):
+    """IVTC drops frames; the decoder must not assume a fixed count."""
+    p = SourceProfile.probe(synthetic_clip)
+    frames = list(Decoder(p, video_filter="select='not(mod(n,2))'").frames())
+    assert len(frames) == 25
+
+
+def test_filter_combines_with_seeking(synthetic_clip):
+    p = SourceProfile.probe(synthetic_clip)
+    frames = list(
+        Decoder(p, start_frame=10, max_frames=5, video_filter="hqdn3d=4:3:6:4").frames()
+    )
+    assert len(frames) == 5

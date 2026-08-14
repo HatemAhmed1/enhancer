@@ -101,10 +101,12 @@ class Decoder:
         profile: SourceProfile,
         start_frame: int = 0,
         max_frames: int | None = None,
+        video_filter: str = "",
     ) -> None:
         self.profile = profile
         self.start_frame = start_frame
         self.max_frames = max_frames
+        self.video_filter = video_filter
 
     def _command(self) -> list[str]:
         p = self.profile
@@ -123,6 +125,8 @@ class Decoder:
         # video content itself. That silently inflates the decoded frame
         # count on any audio-bearing source.
         cmd += ["-map", "0:v:0", "-fps_mode", "passthrough"]
+        if self.video_filter:
+            cmd += ["-vf", self.video_filter]
         cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
         return cmd
 
