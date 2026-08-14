@@ -213,6 +213,7 @@ class TileRunner:
         scale: int,
         min_tile: int = 128,
         recover_after: int = 64,
+        vram_ceiling: int | None = None,
     ) -> None:
         self.tile = tile
         self.max_tile = tile
@@ -222,6 +223,7 @@ class TileRunner:
         self.recover_after = recover_after
         self._probe_interval = recover_after
         self._successes = 0
+        self.vram_ceiling = vram_ceiling
 
     def _step_down(self, tile: int) -> int:
         for rung in TILE_LADDER:
@@ -235,7 +237,9 @@ class TileRunner:
                 return rung
         return self.max_tile
 
-    def run(self, fn: InferFn, img: torch.Tensor) -> torch.Tensor:
+    def run(
+        self, fn: InferFn, img: torch.Tensor, peak_bytes: int | None = None
+    ) -> torch.Tensor:
         # Doubles at most once per call: an OOM'd frame can retry through
         # several ladder rungs before it fits, and that is still a single
         # transient event, not one probe-interval doubling per retry.
@@ -263,7 +267,30 @@ class TileRunner:
                 continue
 
             self._note_success()
+            self._check_pressure(peak_bytes)
             return out
+
+    def _check_pressure(self, peak_bytes: int | None) -> None:
+        """Shrink on silent oversubscription (spec §1.1.1).
+
+        On Windows WDDM an over-budget allocation does not raise; it spills into
+        shared system memory and merely gets slow. Polling the allocator peak is
+        the only reliable signal there.
+        """
+        if self.vram_ceiling is None or peak_bytes is None:
+            return
+        if peak_bytes <= self.vram_ceiling:
+            return
+        if self.tile <= self.min_tile:
+            return
+        self._successes = 0
+        self._probe_interval = min(self._probe_interval * 2, MAX_PROBE_INTERVAL)
+        self.tile = self._step_down(self.tile)
+        log.warning(
+            "Peak allocation %.0f MB exceeded the %.0f MB physical ceiling "
+            "without raising; shrinking tile to %d",
+            peak_bytes / 1024 ** 2, self.vram_ceiling / 1024 ** 2, self.tile,
+        )
 
     def _note_success(self) -> None:
         if self.tile >= self.max_tile:
@@ -296,6 +323,41 @@ def choose_tile(
         if padded * padded * bytes_per_output_pixel * scale * scale <= budget:
             return tile
     return TILE_LADDER[-1]
+
+
+# Calibrated per-output-pixel activation cost at fp16, from Plan 1 measurements.
+BYTES_PER_OUTPUT_PIXEL_FP16: int = 32
+
+
+def bytes_per_output_pixel_for_dtype(dtype: torch.dtype) -> int:
+    """Per-output-pixel activation budget for a model running in `dtype`.
+
+    An architecture spandrel reports as supports_half=False runs fp32 and needs
+    roughly double the activation memory of the fp16 case the constant is
+    calibrated against.
+    """
+    if dtype in (torch.float16, torch.bfloat16):
+        return BYTES_PER_OUTPUT_PIXEL_FP16
+    return BYTES_PER_OUTPUT_PIXEL_FP16 * 2
+
+
+def physical_vram_ceiling(total_bytes: int) -> int:
+    """Hard allocation ceiling derived from PHYSICAL VRAM.
+
+    Windows WDDM will silently oversubscribe into system-RAM-backed shared GPU
+    memory rather than raising a catchable OOM, so an exception-driven recovery
+    policy alone is not sufficient. This ceiling gives the runner something to
+    compare against.
+    """
+    return max(0, total_bytes - HEADROOM_BYTES)
+
+
+def total_vram_bytes() -> int:
+    """Physical VRAM on the current CUDA device, or 0 when unavailable."""
+    if not torch.cuda.is_available():
+        return 0
+    _free, total = torch.cuda.mem_get_info()
+    return int(total)
 
 
 def free_vram_bytes() -> int:

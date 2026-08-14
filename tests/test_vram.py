@@ -373,3 +373,53 @@ def test_choose_tile_accounts_for_scale():
 
 def test_select_device_returns_cpu_when_not_preferring_cuda():
     assert select_device(prefer_cuda=False) == torch.device("cpu")
+
+
+from enhancer.vram import (
+    bytes_per_output_pixel_for_dtype,
+    physical_vram_ceiling,
+)
+
+
+def test_bytes_per_pixel_doubles_for_float32():
+    fp16 = bytes_per_output_pixel_for_dtype(torch.float16)
+    fp32 = bytes_per_output_pixel_for_dtype(torch.float32)
+    assert fp32 == fp16 * 2
+
+
+def test_bytes_per_pixel_is_positive():
+    assert bytes_per_output_pixel_for_dtype(torch.float16) > 0
+
+
+def test_physical_ceiling_subtracts_headroom():
+    assert physical_vram_ceiling(total_bytes=6 * 1024 ** 3) == 6 * 1024 ** 3 - HEADROOM_BYTES
+
+
+def test_physical_ceiling_never_negative():
+    assert physical_vram_ceiling(total_bytes=0) == 0
+
+
+def test_runner_shrinks_when_peak_exceeds_ceiling_without_exception():
+    """Windows WDDM oversubscribes silently instead of raising.
+
+    The runner must treat a peak allocation above the physical ceiling as a
+    pressure signal, even though no exception was raised.
+    """
+    runner = TileRunner(tile=512, overlap=0, scale=1, min_tile=128, vram_ceiling=1000)
+    img = torch.rand(1, 3, 64, 64)
+    runner.run(lambda t: t, img, peak_bytes=5000)
+    assert runner.tile < 512, "peak above ceiling must shrink the tile"
+
+
+def test_runner_does_not_shrink_when_peak_within_ceiling():
+    runner = TileRunner(tile=512, overlap=0, scale=1, min_tile=128, vram_ceiling=10_000)
+    img = torch.rand(1, 3, 64, 64)
+    runner.run(lambda t: t, img, peak_bytes=5000)
+    assert runner.tile == 512
+
+
+def test_runner_ignores_peak_when_no_ceiling_configured():
+    runner = TileRunner(tile=512, overlap=0, scale=1, min_tile=128)
+    img = torch.rand(1, 3, 64, 64)
+    runner.run(lambda t: t, img, peak_bytes=10 ** 12)
+    assert runner.tile == 512

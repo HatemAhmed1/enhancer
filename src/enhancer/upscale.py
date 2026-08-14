@@ -7,7 +7,7 @@ import logging
 import numpy as np
 import torch
 
-from .vram import TileFloorReached, TileRunner
+from .vram import TileFloorReached, TileRunner, physical_vram_ceiling, total_vram_bytes
 
 log = logging.getLogger(__name__)
 
@@ -61,8 +61,10 @@ class Upscaler:
                     "this tier in fp32, which will be slower",
                     getattr(model, "arch", type(model).__name__), model_dtype,
                 )
+        ceiling = physical_vram_ceiling(total_vram_bytes()) if self.device.type == "cuda" else None
         self.runner = TileRunner(
-            tile=tile, overlap=overlap, scale=model.scale, min_tile=128
+            tile=tile, overlap=overlap, scale=model.scale,
+            min_tile=128, vram_ceiling=ceiling,
         )
         self.cpu_fallback_count = 0
 
@@ -74,8 +76,18 @@ class Upscaler:
 
     def process(self, frame: np.ndarray) -> np.ndarray:
         img = to_tensor(frame).to(self.device)
+        track = self.device.type == "cuda" and torch.cuda.is_available()
+        if track:
+            torch.cuda.reset_peak_memory_stats()
         try:
             out = self.runner.run(self._infer, img)
+            if track:
+                # The true peak is only known once the run has finished, so it
+                # cannot be passed into run() itself; this is the single live
+                # pressure check for this frame (run()'s own internal check is
+                # a no-op here since it is called without peak_bytes).
+                peak = int(torch.cuda.max_memory_allocated())
+                self.runner._check_pressure(peak)
         except TileFloorReached:
             self.cpu_fallback_count += 1
             log.warning(
