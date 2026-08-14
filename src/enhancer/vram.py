@@ -165,3 +165,35 @@ class TileRunner:
             self.tile = min(self.max_tile, self.tile * 2)
             self._successes = 0
             log.info("VRAM pressure eased; tile size raised to %d", self.tile)
+
+
+# Descending ladder of candidate tile sizes (spec §8 step 1).
+TILE_LADDER: tuple[int, ...] = (1024, 768, 512, 384, 256, 192, 128)
+
+# Reserved VRAM. A laptop GPU also drives the desktop compositor under WDDM,
+# so this is deliberately generous (spec §8).
+HEADROOM_BYTES: int = 1024 ** 3
+
+
+def choose_tile(free_bytes: int, bytes_per_pixel: int) -> int:
+    """Pick the largest ladder tile whose working set fits the VRAM budget."""
+    budget = max(0, free_bytes - HEADROOM_BYTES)
+    for tile in TILE_LADDER:
+        if tile * tile * bytes_per_pixel <= budget:
+            return tile
+    return TILE_LADDER[-1]
+
+
+def free_vram_bytes() -> int:
+    """Free VRAM on the current CUDA device, or 0 when CUDA is unavailable."""
+    if not torch.cuda.is_available():
+        return 0
+    free, _total = torch.cuda.mem_get_info()
+    return int(free)
+
+
+def select_device(prefer_cuda: bool = True) -> torch.device:
+    """Return the best available torch device."""
+    if prefer_cuda and torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")

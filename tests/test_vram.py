@@ -135,3 +135,34 @@ def test_recovery_never_exceeds_starting_tile():
     for _ in range(10):
         runner.run(lambda t: t, img)
     assert runner.tile == 128
+
+
+from enhancer.vram import HEADROOM_BYTES, TILE_LADDER, choose_tile
+
+
+def test_headroom_default_is_one_gigabyte():
+    assert HEADROOM_BYTES == 1024 ** 3
+
+
+def test_ladder_is_descending():
+    assert list(TILE_LADDER) == sorted(TILE_LADDER, reverse=True)
+
+
+def test_picks_largest_tile_that_fits():
+    # 3 GB usable after headroom, 64 bytes per input pixel.
+    free = 4 * 1024 ** 3
+    tile = choose_tile(free_bytes=free, bytes_per_pixel=64)
+    budget = free - HEADROOM_BYTES
+    assert tile * tile * 64 <= budget
+    bigger = [t for t in TILE_LADDER if t > tile]
+    for b in bigger:
+        assert b * b * 64 > budget, "should have picked the largest fitting tile"
+
+
+def test_falls_back_to_smallest_tile_when_nothing_fits():
+    tile = choose_tile(free_bytes=HEADROOM_BYTES + 1, bytes_per_pixel=10 ** 9)
+    assert tile == TILE_LADDER[-1]
+
+
+def test_zero_free_memory_returns_smallest_tile():
+    assert choose_tile(free_bytes=0, bytes_per_pixel=64) == TILE_LADDER[-1]
