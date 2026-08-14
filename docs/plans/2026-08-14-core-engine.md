@@ -1,6 +1,6 @@
 # Core Engine Implementation Plan (Plan 1 of 4)
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Implementation note:** each task is a self-contained TDD unit — write the failing test, confirm it fails, implement, confirm it passes, commit. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a headless, OOM-proof, zero-disk-cache image and video upscaling engine plus a benchmark harness that validates the throughput targets in spec §1.1 on the real RTX 3060 Laptop.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12, PyTorch 2.x + CUDA 12.x, spandrel, numpy, ffmpeg/ffprobe (external binaries), pytest.
 
-**Spec reference:** `docs/superpowers/specs/2026-08-14-local-video-upscaler-design.md` (revision 2).
+**Spec reference:** `docs/specs/2026-08-14-local-video-upscaler-design.md` (revision 2).
 
 ---
 
