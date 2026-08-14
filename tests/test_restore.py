@@ -157,3 +157,57 @@ def test_detail_retention_handles_non_integer_scale():
     source = torch.rand(1, 3, 17, 23)
     output = torch.rand(1, 3, 40, 55)
     assert apply_detail_retention(output, source, alpha=0.3).shape == output.shape
+
+
+from enhancer.restore import apply_regrain
+
+
+def test_amount_zero_returns_the_input_unchanged():
+    x = torch.rand(1, 3, 32, 32)
+    assert torch.equal(apply_regrain(x, amount=0.0, seed=0), x)
+
+
+def test_regrain_increases_local_variance():
+    x = torch.full((1, 3, 64, 64), 0.5)
+    grained = apply_regrain(x, amount=0.5, seed=0)
+    assert grained.var() > x.var()
+
+
+def test_regrain_is_deterministic_for_a_given_seed():
+    x = torch.full((1, 3, 32, 32), 0.5)
+    assert torch.equal(
+        apply_regrain(x, amount=0.5, seed=42), apply_regrain(x, amount=0.5, seed=42)
+    )
+
+
+def test_different_seeds_produce_different_grain():
+    x = torch.full((1, 3, 32, 32), 0.5)
+    assert not torch.equal(
+        apply_regrain(x, amount=0.5, seed=1), apply_regrain(x, amount=0.5, seed=2)
+    )
+
+
+def test_regrain_output_stays_in_range():
+    x = torch.rand(1, 3, 32, 32)
+    result = apply_regrain(x, amount=1.0, seed=0)
+    assert float(result.min()) >= 0.0
+    assert float(result.max()) <= 1.0
+
+
+def test_stronger_amount_produces_more_grain():
+    x = torch.full((1, 3, 64, 64), 0.5)
+    light = apply_regrain(x, amount=0.2, seed=0)
+    heavy = apply_regrain(x, amount=0.8, seed=0)
+    assert heavy.var() > light.var()
+
+
+def test_grain_is_suppressed_in_highlights_and_shadows():
+    """Film grain is most visible in midtones; clipped areas show little."""
+    mid = apply_regrain(torch.full((1, 3, 64, 64), 0.5), amount=0.8, seed=0)
+    bright = apply_regrain(torch.full((1, 3, 64, 64), 0.99), amount=0.8, seed=0)
+    assert mid.var() > bright.var()
+
+
+def test_regrain_rejects_amount_out_of_range():
+    with pytest.raises(ValueError):
+        apply_regrain(torch.rand(1, 3, 8, 8), amount=-0.1, seed=0)

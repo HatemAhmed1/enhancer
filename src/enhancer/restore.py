@@ -123,3 +123,45 @@ def apply_detail_retention(
     )
     residual = reference - gaussian_blur(reference, sigma)
     return (output + alpha * residual).clamp_(0.0, 1.0)
+
+
+# Grain amplitude at amount=1.0, in normalised [0, 1] units. Roughly 5/255,
+# which reads as noticeable but not heavy film grain.
+MAX_GRAIN_SIGMA = 0.02
+
+
+def apply_regrain(
+    x: torch.Tensor,
+    amount: float,
+    seed: int = 0,
+    grain_size: float = 0.8,
+) -> torch.Tensor:
+    """Add synthetic grain to an upscaled frame.
+
+    Super-resolution models classify low-contrast skin texture as noise and
+    remove it. Putting grain back is the strongest available counter to the
+    resulting plastic appearance: it restores the high-frequency content that
+    makes skin read as photographed rather than rendered.
+
+    Grain is attenuated towards black and white, mirroring real film, where
+    grain is most visible in the midtones.
+    """
+    _check("amount", amount)
+    if amount == 0.0:
+        return x
+
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    noise = torch.randn(x.shape, generator=generator, dtype=torch.float32).to(x.device)
+
+    if grain_size > 0:
+        noise = gaussian_blur(noise, sigma=grain_size)
+        # Blurring reduces variance; renormalise so `amount` stays meaningful.
+        std = noise.std()
+        if std > 0:
+            noise = noise / std
+
+    # Triangular midtone weighting: peaks at 0.5, falls to zero at 0 and 1.
+    luminance = x.mean(dim=1, keepdim=True)
+    weight = 1.0 - (2.0 * luminance - 1.0).abs()
+
+    return (x + noise * weight * (MAX_GRAIN_SIGMA * amount)).clamp_(0.0, 1.0)
