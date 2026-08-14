@@ -170,3 +170,19 @@ def test_interrupted_render_with_audio_resumes_correctly(tmp_path, synthetic_cli
     assert result.width == 640 and result.height == 480
     assert len(list(Decoder(result).frames())) == 50
     assert _stream_count(out, "a") == 1, "final output must have exactly one audio stream"
+
+
+def test_zero_frame_count_raises_a_clear_error(tmp_path, synthetic_clip):
+    """Some containers report neither frame count nor duration.
+
+    Without this guard the failure surfaces much later as an opaque ffmpeg
+    concat error against an empty file list.
+    """
+    from dataclasses import replace
+
+    profile = replace(SourceProfile.probe(synthetic_clip), frame_count=0)
+    with pytest.raises(ValueError, match="could not determine a frame count"):
+        render_resumable(
+            profile, DoublingUpscaler(), tmp_path / "out.mkv",
+            job_dir=tmp_path / "job", segment_frames=20, settings={"scale": 2},
+        )

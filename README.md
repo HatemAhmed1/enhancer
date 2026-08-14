@@ -10,8 +10,9 @@ Runs entirely offline. No cloud services, no API keys, no telemetry.
 
 ## Features
 
+- **Resumable** — renders are written as independently complete segments, so an interruption costs at most one segment, not the whole job
 - **Streaming pipeline** — frames move through ffmpeg pipes and never touch disk, avoiding the three-pass PNG cache most tools use
-- **OOM-proof** — adaptive tiling shrinks on memory pressure and falls back to CPU per frame rather than crashing
+- **OOM-proof** — adaptive tiling shrinks on memory pressure and falls back to CPU per frame rather than crashing, including on Windows, where the driver oversubscribes silently instead of raising
 - **Any model** — drop any [OpenModelDB](https://openmodeldb.info/) `.pth` into `models/custom/` and it appears automatically; architecture is auto-detected
 - **Colour-correct** — BT.601/709 primaries, transfer, matrix, and sample aspect ratio are preserved end to end
 - **10-bit NVENC output** with audio, subtitle, and chapter passthrough
@@ -107,6 +108,18 @@ Reports frames per second, peak VRAM, selected tile size, and an estimated time 
 .venv\Scripts\python.exe -m enhancer.cli video models\custom\realesr-general-x4v3.pth input.mp4 output.mkv
 ```
 
+**Resume an interrupted render**
+
+Re-run the identical command. Completed segments are skipped and the render picks up where it stopped.
+
+```powershell
+.venv\Scripts\python.exe -m enhancer.cli video models\custom\realesr-general-x4v3.pth input.mp4 output.mkv
+```
+
+State lives in `output.job\` beside the output, or wherever `--job-dir` points. `--segment-frames` controls how much work an interruption can cost — the default of 500 is roughly three minutes at 1080p→4K.
+
+Changing settings between runs is refused rather than silently producing a file with a visible seam mid-render. Start a new job, or restore the original settings.
+
 **Search YouTube**
 
 ```powershell
@@ -180,7 +193,7 @@ Run the test suite:
 | Stage | Contents | Status |
 |---|---|---|
 | Core engine | Tiling, OOM safety, streaming I/O, model loading, benchmarking, YouTube | Complete |
-| Resilience | Resumable renders, physical VRAM ceiling | In progress |
+| Resilience | Resumable renders, physical VRAM ceiling | Complete |
 | Restoration | Deinterlace/IVTC, deblock, degrain, re-grain, detail retention | Planned |
 | Interpolation | RIFE frame interpolation, scene-change detection, target FPS | Planned |
 | Interface | Desktop GUI, dual-pass 2K→4K, segment preview | Planned |

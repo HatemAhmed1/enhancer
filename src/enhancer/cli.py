@@ -56,6 +56,16 @@ def render_resumable(
     settings = settings or {}
     scale = upscaler.scale
 
+    if profile.frame_count <= 0:
+        # Some containers report neither a frame count nor a duration. Without
+        # one there is nothing to divide into segments, and the failure would
+        # otherwise surface as an opaque ffmpeg concat error much later.
+        raise ValueError(
+            f"could not determine a frame count for {profile.path}. The file may "
+            f"be corrupt, or the container may not report duration. Try "
+            f"remuxing it first: ffmpeg -i input -c copy remuxed.mkv"
+        )
+
     if (job_dir / "job.json").exists():
         job = JobState.load(job_dir, settings=settings)
     else:
@@ -124,6 +134,9 @@ def cmd_video(args: argparse.Namespace) -> int:
     except SettingsMismatch as exc:
         print(f"\nCannot resume: {exc}")
         return 2
+    except ValueError as exc:
+        print(f"\n{exc}")
+        return 3
 
     print(f"\nDone. CPU fallbacks: {up.cpu_fallback_count}")
     return 0
