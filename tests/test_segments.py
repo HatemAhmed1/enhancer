@@ -1,3 +1,5 @@
+import subprocess
+
 import numpy as np
 import pytest
 
@@ -9,6 +11,24 @@ from enhancer.segments import (
     write_segment,
 )
 from enhancer.video_io import Decoder, SourceProfile
+
+
+def _stream_count(path, kind):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", kind,
+         "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    return len([line for line in out.stdout.splitlines() if line.strip()])
+
+
+def _duration(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    return float(out.stdout.strip())
 
 
 def test_segment_path_is_zero_padded_and_sortable(tmp_path):
@@ -75,3 +95,38 @@ def test_assemble_concatenates_segments_and_preserves_frame_count(tmp_path, synt
     assemble(tmp_path, count=2, output=final, source=profile)
     assert final.exists()
     assert len(list(Decoder(SourceProfile.probe(final)).frames())) == 50
+
+
+def test_write_segment_does_not_attach_source_audio(tmp_path, synthetic_clip_with_audio):
+    """A single segment must not carry the full source audio track.
+
+    Encoder normally muxes audio from the source; write_segment must opt out
+    (mux_audio=False), otherwise every segment would attach the entire
+    original audio track rather than leaving audio to be muxed once at
+    assembly.
+    """
+    profile = SourceProfile.probe(synthetic_clip_with_audio)
+    frames = list(Decoder(profile).frames())[:10]
+    out = segment_path(tmp_path, 0)
+    write_segment(out, iter(frames), width=320, height=240, fps=25.0, source=profile)
+    assert _stream_count(out, "a") == 0, "a segment must not carry the source audio track"
+
+
+def test_assemble_muxes_audio_exactly_once(tmp_path, synthetic_clip_with_audio):
+    """Assembly must mux the source audio once, not accumulate it per segment."""
+    profile = SourceProfile.probe(synthetic_clip_with_audio)
+    all_frames = list(Decoder(profile).frames())
+    write_segment(segment_path(tmp_path, 0), iter(all_frames[:25]),
+                  width=320, height=240, fps=25.0, source=profile)
+    write_segment(segment_path(tmp_path, 1), iter(all_frames[25:50]),
+                  width=320, height=240, fps=25.0, source=profile)
+
+    final = tmp_path / "final.mkv"
+    assemble(tmp_path, count=2, output=final, source=profile)
+    assert _stream_count(final, "a") == 1, "assembled output must have exactly one audio stream"
+
+    source_duration = _duration(synthetic_clip_with_audio)
+    final_duration = _duration(final)
+    assert abs(final_duration - source_duration) < 0.2, (
+        f"expected assembled duration near {source_duration:.2f}s, got {final_duration:.2f}s"
+    )
