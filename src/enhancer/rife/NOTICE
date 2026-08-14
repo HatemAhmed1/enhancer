@@ -1,0 +1,90 @@
+RIFE (Real-Time Intermediate Flow Estimation) — vendored network code
+=======================================================================
+
+Upstream project: Practical-RIFE
+Upstream URL:     https://github.com/hzwer/Practical-RIFE
+Upstream licence: MIT (copyright (c) 2021 hzwer)
+
+Model version:    RIFE 4.25, released 2024-09-19 (per the upstream README's
+                   "Trained Model" table, which recommends 4.25 as the
+                   default for most scenes).
+
+Vendored on:      2026-08-14
+
+What was vendored
+------------------
+`ifnet.py` in this directory contains the `IFNet` network architecture
+(`Head`, `ResConv`, `IFBlock`, `IFNet`, and the `warp` helper) that
+upstream ships as `train_log/IFNet_HDv3.py` and `model/warplayer.py`.
+Only the network classes were kept — the `Model` training/inference
+wrapper (`train_log/RIFE_HDv3.py`), the optimizer, loss functions, and
+dataset code were not reproduced.
+
+The `warp` grid-sampling helper is inlined into `ifnet.py` (upstream keeps
+it in a separate `model/warplayer.py` module that is not part of this
+vendored subset) and has one behavioural fix: upstream builds its sampling
+grid on a module-level `device` that is fixed to CUDA-if-available at
+import time, which breaks CPU inference on any machine that also has a
+CUDA device. The vendored version builds the grid on the input tensor's
+own device instead. This is the only intentional deviation from upstream;
+everything else is unmodified apart from the import adjustment needed to
+remove the dependency on the separate `model.warplayer` module.
+
+Provenance of the vendored text
+--------------------------------
+Practical-RIFE distributes each model version as a Google Drive archive
+(architecture source + `flownet.pkl` weights bundled together) rather than
+committing `train_log/` to git, so the exact file cannot be fetched from
+the upstream git history. The architecture text used here was taken from:
+
+- https://github.com/HThanh-how/RIFEv4.25_0919/blob/main/train_log/IFNet_HDv3.py
+  — a community re-upload of the unzipped 4.25 (2024-09-19) archive,
+  matching the release date and filenames the upstream README describes.
+
+Its channel dimensions (5 IFBlocks, c=[192, 128, 96, 64, 32], Head with a
+4-channel output) were cross-checked against an independent, actively
+maintained MIT-licensed port of the same version:
+
+- https://github.com/HolyWu/vs-rife/blob/main/vsrife/IFNet_HDv3_v4_25.py
+  (HolyWu/vs-rife, MIT licence, copyright (c) 2021 HolyWu)
+
+The two agree on architecture shape; vs-rife's version was not used
+directly because its `forward()` has been refactored to take precomputed
+head features and warp grids as extra arguments (an optimisation for its
+own streaming pipeline), which would no longer match the upstream
+"unmodified apart from import fixes" form this project vendors.
+
+Weights
+-------
+`flownet.pkl` (RIFE 4.25) is downloaded from a direct HTTPS URL, not
+committed to this repository (`models/` is gitignored):
+
+    https://github.com/HolyWu/vs-rife/releases/download/model/flownet_v4.25.pkl
+
+This is the same v4.25 weight file the vs-rife project's own auto-download
+feature fetches; it is hosted as a GitHub release asset, so — unlike the
+upstream Google Drive links — it is fetchable with a plain HTTP GET.
+
+Licence
+-------
+MIT License
+
+Copyright (c) 2021 hzwer
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
