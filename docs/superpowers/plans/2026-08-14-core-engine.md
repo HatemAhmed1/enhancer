@@ -28,6 +28,19 @@ tile boundaries, and no weight-map allocation is needed. The overlap still serve
 giving the model receptive-field context so core pixels are computed as if the tile boundary were
 not there.
 
+### Why `is_oom_error` is wider than `torch.cuda.OutOfMemoryError`
+
+The engine's contract is that it must never die from an out-of-memory error. Catching only
+`torch.cuda.OutOfMemoryError` does not honor that contract: CUDA exhaustion routinely surfaces
+through cuDNN/cuBLAS workspace allocation or driver-level failures as a plain `RuntimeError` with
+a message like `"CUDNN_STATUS_ALLOC_FAILED"`, and the CPU fallback path can raise a plain
+`MemoryError`. A `TileRunner` that only catches the typed exception will let any of these kill a
+multi-hour render. `is_oom_error` therefore also pattern-matches known-recoverable `RuntimeError`
+messages — but deliberately does **not** match `"illegal memory access"` or other corruption-class
+CUDA errors, because those are not safe to retry: retrying them forever would silently hide a real
+bug instead of surfacing it. Do not "simplify" this back to `except torch.cuda.OutOfMemoryError`;
+that reintroduces the exact crash the module exists to prevent.
+
 ---
 
 ## File structure
@@ -258,12 +271,27 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'enhancer.vram'`
 
 - [ ] **Step 3: Write minimal implementation**
 
+All of `vram.py`'s imports are declared here, up front, even though `logging` and `torch` are not
+yet used by this task's code. Tasks 3–5 only ever append new module-level definitions below
+`plan_tiles`; they never add new `import` lines mid-file. (An earlier draft of this plan let later
+tasks splice imports in wherever their new code landed, which produced a file with import
+statements scattered after function definitions — a real lint violation. Front-loading the header
+here avoids that permanently.)
+
 ```python
 """Tiling, tiled execution, and out-of-memory recovery."""
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
+
+import torch
+
+log = logging.getLogger(__name__)
+
+InferFn = Callable[[torch.Tensor], torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -334,13 +362,22 @@ git add src/enhancer/vram.py tests/test_vram.py && git commit -m "feat(vram): ti
 - Modify: `src/enhancer/vram.py`
 - Test: `tests/test_vram.py`
 
+This task also introduces `is_oom_error` and `TileFloorReached`, ahead of the OOM retry policy
+they're named for (Task 4). They have to land here because the output-buffer allocation below
+needs both: attributing an allocation failure on the *full-size* output buffer to `TileFloorReached`
+(instead of retrying at ever-smaller tile sizes that can never help, since that buffer's size
+doesn't depend on tile size) is part of what makes this task's tiled execution correct. `run_tiled`
+also validates that `fn` actually upscaled by `scale`, in both the multi-tile and single-tile paths
+— without that, a scale mismatch (e.g. driving a 4x model with `scale=2`) slices successfully and
+writes scrambled pixels with no error at all.
+
 - [ ] **Step 1: Write the failing test**
 
 Append to `tests/test_vram.py`:
 
 ```python
 import torch
-from enhancer.vram import run_tiled
+from enhancer.vram import is_oom_error, run_tiled
 
 
 def test_identity_roundtrip_is_exact_at_zero_overlap():
@@ -376,23 +413,144 @@ def test_single_tile_path_matches_direct_call():
     img = torch.rand(1, 3, 32, 32)
     out = run_tiled(lambda t: t * 2, img, tile=256, overlap=16, scale=1)
     assert torch.equal(out, img * 2)
+
+
+def test_reassembly_is_exact_for_non_square_non_divisible_at_scale_4():
+    """Bit-exact, not allclose — nearest-neighbor has no float accumulation,
+    so any crop-offset bug shows up as a hard mismatch. Non-square,
+    non-divisible-by-tile-size, scale > 1: the combination that actually
+    exercises the offset arithmetic."""
+    img = torch.rand(1, 3, 213, 377)
+    fn = lambda t: torch.nn.functional.interpolate(t, scale_factor=4, mode="nearest")
+    tiled = run_tiled(fn, img, tile=64, overlap=16, scale=4)
+    assert torch.equal(tiled, fn(img))
+
+
+def test_scale_mismatch_raises_instead_of_corrupting():
+    img = torch.rand(1, 3, 64, 64)
+    fn = lambda t: torch.nn.functional.interpolate(t, scale_factor=4, mode="nearest")
+    with pytest.raises(ValueError):
+        run_tiled(fn, img, tile=16, overlap=4, scale=2)
+
+
+def test_single_tile_path_also_validates_scale():
+    """The single-tile fast path must agree with the multi-tile path."""
+    img = torch.rand(1, 3, 32, 32)
+    fn = lambda t: torch.nn.functional.interpolate(t, scale_factor=4, mode="nearest")
+    with pytest.raises(ValueError):
+        run_tiled(fn, img, tile=256, overlap=16, scale=2)
+
+
+def test_zero_dimension_image_raises_value_error():
+    img = torch.rand(1, 3, 0, 64)
+    with pytest.raises(ValueError):
+        run_tiled(lambda t: t, img, tile=32, overlap=0, scale=1)
+
+
+def test_nonpositive_scale_raises_value_error():
+    img = torch.rand(1, 3, 32, 32)
+    with pytest.raises(ValueError):
+        run_tiled(lambda t: t, img, tile=32, overlap=0, scale=0)
+
+
+def test_is_oom_error_accepts_plain_runtime_error_variants():
+    assert is_oom_error(RuntimeError("CUDA error: out of memory"))
+    assert is_oom_error(RuntimeError("cuDNN error: CUDNN_STATUS_ALLOC_FAILED"))
+    assert is_oom_error(RuntimeError("CUBLAS_STATUS_ALLOC_FAILED"))
+    assert is_oom_error(MemoryError("cannot allocate"))
+    assert is_oom_error(torch.cuda.OutOfMemoryError("CUDA out of memory"))
+
+
+def test_is_oom_error_rejects_unrelated_runtime_error():
+    """Retrying an illegal memory access forever would mask a real bug."""
+    assert not is_oom_error(
+        RuntimeError("CUDA error: an illegal memory access was encountered")
+    )
+    assert not is_oom_error(ValueError("nope"))
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_vram.py -v -k run_tiled or roundtrip or scale or nearest or single_tile`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_vram.py -v -k run_tiled or roundtrip or scale or nearest or single_tile or oom_error`
 Expected: FAIL with `ImportError: cannot import name 'run_tiled'`
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add to `src/enhancer/vram.py`:
+Add to `src/enhancer/vram.py` (below `plan_tiles`; no new import lines — they're all in the header
+from Task 2):
 
 ```python
-from collections.abc import Callable
+# Substrings identifying a RECOVERABLE allocation failure. Deliberately narrow:
+# "CUDA error: an illegal memory access" is unrecoverable and must NOT match,
+# because retrying it forever would hide a real bug.
+_OOM_MARKERS: tuple[str, ...] = (
+    "out of memory",
+    "alloc_failed",
+    "cuda_error_out_of_memory",
+)
 
-import torch
 
-InferFn = Callable[[torch.Tensor], torch.Tensor]
+def is_oom_error(exc: BaseException) -> bool:
+    """True if `exc` is a recoverable allocation failure.
+
+    CUDA exhaustion does not always arrive as torch.cuda.OutOfMemoryError.
+    cuDNN and cuBLAS workspace allocation and driver-level failures surface as
+    a plain RuntimeError, and the CPU fallback path raises MemoryError. Catching
+    only the typed error lets a real OOM kill a multi-hour render.
+    """
+    if isinstance(exc, (torch.cuda.OutOfMemoryError, MemoryError)):
+        return True
+    if isinstance(exc, RuntimeError):
+        message = str(exc).lower()
+        return any(marker in message for marker in _OOM_MARKERS)
+    return False
+
+
+class TileFloorReached(Exception):
+    """Tiling cannot make this frame fit. The caller should fall back to CPU.
+
+    Deliberately NOT a RuntimeError subclass: TileRunner (Task 4) widens its
+    except clause to RuntimeError, and this signal must pass through it
+    uncaught.
+    """
+
+
+def _check_scale(out: torch.Tensor, inp: torch.Tensor, scale: int) -> None:
+    """Verify the model actually upscaled by `scale`.
+
+    Without this, a mismatch (e.g. a 4x model driven with scale=2) slices
+    successfully and writes scrambled pixels with no error at all.
+    """
+    expected = (inp.shape[-2] * scale, inp.shape[-1] * scale)
+    actual = tuple(out.shape[-2:])
+    if actual != expected:
+        raise ValueError(
+            f"model returned {actual} for a {tuple(inp.shape[-2:])} input; "
+            f"expected {expected} at scale={scale}"
+        )
+
+
+def _alloc_output(sample: torch.Tensor, h: int, w: int, scale: int) -> torch.Tensor:
+    """Allocate the full output buffer, attributing its failure correctly.
+
+    This buffer's size depends only on h, w and scale, so shrinking tiles cannot
+    make it fit. Reporting it as TileFloorReached sends the caller straight to
+    the CPU fallback instead of burning several pointless halving rounds and
+    then blaming the tile size.
+    """
+    try:
+        return torch.empty(
+            (sample.shape[0], sample.shape[1], h * scale, w * scale),
+            dtype=sample.dtype,
+            device=sample.device,
+        )
+    except Exception as exc:
+        if is_oom_error(exc):
+            raise TileFloorReached(
+                f"output buffer {h * scale}x{w * scale} does not fit in memory; "
+                f"tiling cannot reduce it"
+            ) from exc
+        raise
 
 
 def run_tiled(
@@ -409,12 +567,19 @@ def run_tiled(
     """
     if img.ndim != 4:
         raise ValueError(f"expected a 4-D (B, C, H, W) tensor, got shape {tuple(img.shape)}")
+    if scale <= 0:
+        raise ValueError(f"scale must be positive, got {scale}")
 
     _, _, h, w = img.shape
+    if h <= 0 or w <= 0:
+        raise ValueError(f"image has a zero dimension: {h}x{w}")
+
     tiles = plan_tiles(h, w, tile, overlap)
 
     if len(tiles) == 1:
-        return fn(img)
+        out = fn(img)
+        _check_scale(out, img, scale)
+        return out
 
     out: torch.Tensor | None = None
     for t in tiles:
@@ -422,12 +587,13 @@ def run_tiled(
         up = fn(patch)
 
         if out is None:
-            b, c = up.shape[0], up.shape[1]
-            out = torch.empty(
-                (b, c, h * scale, w * scale), dtype=up.dtype, device=up.device
-            )
+            _check_scale(up, patch, scale)
+            out = _alloc_output(up, h, w, scale)
 
         # Offset of the core within the padded patch, in output pixels.
+        # Do not change this arithmetic — it is verified correct at
+        # non-square, non-divisible sizes and scale > 1 (see the
+        # non_square_non_divisible test above).
         oy = (t.y0 - t.py0) * scale
         ox = (t.x0 - t.px0) * scale
         ch = (t.y1 - t.y0) * scale
@@ -444,7 +610,7 @@ def run_tiled(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_vram.py -v`
-Expected: 10 passed
+Expected: 17 passed
 
 - [ ] **Step 5: Commit**
 
@@ -460,8 +626,13 @@ git add src/enhancer/vram.py tests/test_vram.py && git commit -m "feat(vram): ti
 - Modify: `src/enhancer/vram.py`
 - Test: `tests/test_vram.py`
 
-Implements spec §8 steps 2–4: halve the tile on OOM, retry the same frame, stop at a floor, and
-step back up after sustained success.
+Implements spec §8 steps 2–4: on any recoverable allocation failure (as classified by
+`is_oom_error`, Task 3 — not just the typed `torch.cuda.OutOfMemoryError`), step the tile down the
+ladder, retry the same frame, stop at a floor, and probe back up after sustained success. The
+recovery probe interval doubles after every failure at that tile size, capped at
+`MAX_PROBE_INTERVAL`. A fixed interval would re-probe (and re-fail against) a tile size that
+genuinely never fits every `recover_after` frames, forever, over a multi-hour render; the doubling
+interval converges instead.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -485,15 +656,15 @@ def _oom_for_first(n_failures):
     return fn
 
 
-def test_halves_tile_on_oom_and_succeeds():
+def test_steps_down_ladder_on_oom_and_succeeds():
     runner = TileRunner(tile=256, overlap=0, scale=1, min_tile=32)
     img = torch.rand(1, 3, 64, 64)
     out = runner.run(_oom_for_first(1), img)
     assert torch.equal(out, img)
-    assert runner.tile == 128
+    assert runner.tile == 192, "the next rung down from 256 is 192, not 128"
 
 
-def test_halves_repeatedly_until_success():
+def test_steps_down_repeatedly_until_success():
     runner = TileRunner(tile=256, overlap=0, scale=1, min_tile=32)
     img = torch.rand(1, 3, 64, 64)
     runner.run(_oom_for_first(3), img)
@@ -508,11 +679,14 @@ def test_raises_tile_floor_reached_when_floor_still_ooms():
 
 
 def test_recovers_tile_size_after_sustained_success():
+    """recover_after=3 sets the initial probe interval to 3, but the one OOM
+    below doubles it to 6, so it takes 5 more successes (6 total) — not 3 —
+    before the tile steps back up."""
     runner = TileRunner(tile=256, overlap=0, scale=1, min_tile=32, recover_after=3)
     img = torch.rand(1, 3, 64, 64)
     runner.run(_oom_for_first(1), img)
-    assert runner.tile == 128
-    for _ in range(3):
+    assert runner.tile == 192
+    for _ in range(5):
         runner.run(lambda t: t, img)
     assert runner.tile == 256, "tile should step back up after sustained success"
 
@@ -523,32 +697,88 @@ def test_recovery_never_exceeds_starting_tile():
     for _ in range(10):
         runner.run(lambda t: t, img)
     assert runner.tile == 128
+
+
+def test_runner_recovers_from_plain_runtime_error_oom():
+    calls = {"n": 0}
+
+    def fn(t):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("CUDA error: out of memory")
+        return t
+
+    runner = TileRunner(tile=256, overlap=0, scale=1, min_tile=32)
+    img = torch.rand(1, 3, 64, 64)
+    out = runner.run(fn, img)
+    assert torch.equal(out, img)
+    assert calls["n"] == 2
+
+
+def test_runner_propagates_non_oom_errors():
+    def fn(t):
+        raise ValueError("boom")
+
+    runner = TileRunner(tile=256, overlap=0, scale=1, min_tile=32)
+    img = torch.rand(1, 3, 64, 64)
+    with pytest.raises(ValueError):
+        runner.run(fn, img)
+
+
+def test_probe_interval_backs_off_so_oom_does_not_repeat_forever():
+    threshold = 256
+    recover_after = 5
+    n_frames = 500
+    runner = TileRunner(tile=1024, overlap=0, scale=1, min_tile=128, recover_after=recover_after)
+    oom_count = {"n": 0}
+
+    def fn(patch):
+        if runner.tile > threshold:
+            oom_count["n"] += 1
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+        return patch
+
+    img = torch.rand(1, 3, 64, 64)  # smaller than any ladder rung: always single-tile
+    for _ in range(n_frames):
+        runner.run(fn, img)
+
+    linear_bound = n_frames // recover_after
+    assert oom_count["n"] < linear_bound, (
+        f"{oom_count['n']} OOMs over {n_frames} frames is not far fewer than "
+        f"the fixed-interval bound of {linear_bound}"
+    )
+    assert oom_count["n"] < 20, "expected logarithmic growth, not linear"
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_vram.py -v -k TileRunner or oom or floor or recover`
-Expected: FAIL with `ImportError: cannot import name 'TileFloorReached'`
+Expected: FAIL with `ImportError: cannot import name 'TileRunner'`
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add to `src/enhancer/vram.py`:
+Add to `src/enhancer/vram.py` (no new import lines — `TileFloorReached` and `is_oom_error` already
+exist from Task 3):
 
 ```python
-import logging
+# Descending ladder of candidate tile sizes. Used for stepping in BOTH
+# directions so that shrink and recover are symmetric.
+TILE_LADDER: tuple[int, ...] = (1024, 768, 512, 384, 256, 192, 128)
 
-log = logging.getLogger(__name__)
-
-
-class TileFloorReached(RuntimeError):
-    """Raised when even the smallest tile cannot fit in VRAM.
-
-    Callers should fall back to CPU for this frame (spec §8 step 3).
-    """
+# Upper bound on the success-probe backoff, so probes stay rare but never stop.
+MAX_PROBE_INTERVAL: int = 8192
 
 
 class TileRunner:
-    """Runs tiled inference, shrinking tiles on OOM and recovering afterwards."""
+    """Runs tiled inference, shrinking tiles on OOM and probing back upward.
+
+    On an allocation failure the tile steps down the ladder and the frame is
+    retried. After sustained success the runner probes a larger tile again, with
+    the probe interval doubling after each failure. That converges: a size that
+    genuinely does not fit is retried a handful of times over a long render
+    rather than every `recover_after` frames forever, while a transient spike
+    from another application still recovers.
+    """
 
     def __init__(
         self,
@@ -564,22 +794,40 @@ class TileRunner:
         self.scale = scale
         self.min_tile = min_tile
         self.recover_after = recover_after
+        self._probe_interval = recover_after
         self._successes = 0
+
+    def _step_down(self, tile: int) -> int:
+        for rung in TILE_LADDER:
+            if rung < tile:
+                return max(self.min_tile, rung)
+        return self.min_tile
+
+    def _step_up(self, tile: int) -> int:
+        for rung in reversed(TILE_LADDER):
+            if rung > tile:
+                return rung
+        return tile
 
     def run(self, fn: InferFn, img: torch.Tensor) -> torch.Tensor:
         while True:
             try:
                 out = run_tiled(fn, img, self.tile, self.overlap, self.scale)
-            except torch.cuda.OutOfMemoryError:
+            except TileFloorReached:
+                raise
+            except Exception as exc:
+                if not is_oom_error(exc):
+                    raise
                 self._successes = 0
+                self._probe_interval = min(self._probe_interval * 2, MAX_PROBE_INTERVAL)
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 if self.tile <= self.min_tile:
                     raise TileFloorReached(
-                        f"OOM at minimum tile size {self.min_tile}"
-                    ) from None
-                self.tile = max(self.min_tile, self.tile // 2)
-                log.warning("CUDA OOM; retrying frame at tile=%d", self.tile)
+                        f"allocation failed at minimum tile size {self.min_tile}"
+                    ) from exc
+                self.tile = self._step_down(self.tile)
+                log.warning("Allocation failure; retrying frame at tile=%d", self.tile)
                 continue
 
             self._note_success()
@@ -589,21 +837,21 @@ class TileRunner:
         if self.tile >= self.max_tile:
             return
         self._successes += 1
-        if self._successes >= self.recover_after:
-            self.tile = min(self.max_tile, self.tile * 2)
+        if self._successes >= self._probe_interval:
+            self.tile = min(self.max_tile, self._step_up(self.tile))
             self._successes = 0
-            log.info("VRAM pressure eased; tile size raised to %d", self.tile)
+            log.info("VRAM pressure eased; probing tile size %d", self.tile)
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_vram.py -v`
-Expected: 15 passed
+Expected: 25 passed
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/enhancer/vram.py tests/test_vram.py && git commit -m "feat(vram): OOM retry policy with tile halving and recovery"
+git add src/enhancer/vram.py tests/test_vram.py && git commit -m "feat(vram): OOM retry policy with ladder stepping and backing-off recovery"
 ```
 
 ---
@@ -614,14 +862,22 @@ git add src/enhancer/vram.py tests/test_vram.py && git commit -m "feat(vram): OO
 - Modify: `src/enhancer/vram.py`
 - Test: `tests/test_vram.py`
 
-Implements spec §8 step 1, with the 1 GB default headroom.
+Implements spec §8 step 1, with the 1 GB default headroom. `TILE_LADDER` already exists (Task 4);
+this task only adds `HEADROOM_BYTES` and the functions below.
+
+`choose_tile`'s cost model uses the PADDED tile area (`tile + 2*overlap`), because that's what
+actually gets allocated for inference, and scales by `scale**2`, because a 4x model produces 16x
+the output pixels of a 1x model for the same input tile. Ignoring either factor under-provisions
+the initial tile size and pushes more of the OOM-retry burden onto `TileRunner` than necessary.
+`bytes_per_output_pixel` must therefore be a calibration constant that does NOT already bake in the
+scale factor — `choose_tile` applies it.
 
 - [ ] **Step 1: Write the failing test**
 
 Append to `tests/test_vram.py`:
 
 ```python
-from enhancer.vram import HEADROOM_BYTES, TILE_LADDER, choose_tile
+from enhancer.vram import HEADROOM_BYTES, TILE_LADDER, choose_tile, select_device
 
 
 def test_headroom_default_is_one_gigabyte():
@@ -633,9 +889,9 @@ def test_ladder_is_descending():
 
 
 def test_picks_largest_tile_that_fits():
-    # 3 GB usable after headroom, 64 bytes per input pixel.
+    # 3 GB usable after headroom, 64 bytes per output pixel.
     free = 4 * 1024 ** 3
-    tile = choose_tile(free_bytes=free, bytes_per_pixel=64)
+    tile = choose_tile(free_bytes=free, bytes_per_output_pixel=64)
     budget = free - HEADROOM_BYTES
     assert tile * tile * 64 <= budget
     bigger = [t for t in TILE_LADDER if t > tile]
@@ -644,37 +900,79 @@ def test_picks_largest_tile_that_fits():
 
 
 def test_falls_back_to_smallest_tile_when_nothing_fits():
-    tile = choose_tile(free_bytes=HEADROOM_BYTES + 1, bytes_per_pixel=10 ** 9)
+    tile = choose_tile(free_bytes=HEADROOM_BYTES + 1, bytes_per_output_pixel=10 ** 9)
     assert tile == TILE_LADDER[-1]
 
 
 def test_zero_free_memory_returns_smallest_tile():
-    assert choose_tile(free_bytes=0, bytes_per_pixel=64) == TILE_LADDER[-1]
+    assert choose_tile(free_bytes=0, bytes_per_output_pixel=64) == TILE_LADDER[-1]
+
+
+def test_choose_tile_accounts_for_overlap():
+    """The padded (tile + 2*overlap) area is what's actually allocated."""
+    bytes_per_output_pixel = 1
+    budget = 100_000
+    free = budget + HEADROOM_BYTES
+
+    no_overlap = choose_tile(free_bytes=free, bytes_per_output_pixel=bytes_per_output_pixel, overlap=0)
+    with_overlap = choose_tile(free_bytes=free, bytes_per_output_pixel=bytes_per_output_pixel, overlap=32)
+
+    assert no_overlap == 256
+    assert with_overlap < no_overlap
+
+    padded = with_overlap + 2 * 32
+    assert padded * padded * bytes_per_output_pixel <= budget
+
+
+def test_choose_tile_accounts_for_scale():
+    """A 4x model produces 16x the pixels, so it must pick a smaller tile."""
+    free = HEADROOM_BYTES + 50 * 1024 * 1024
+    bytes_per_output_pixel = 64
+
+    t1 = choose_tile(free_bytes=free, bytes_per_output_pixel=bytes_per_output_pixel, scale=1)
+    t4 = choose_tile(free_bytes=free, bytes_per_output_pixel=bytes_per_output_pixel, scale=4)
+
+    assert t4 < t1
+
+
+def test_select_device_returns_cpu_when_not_preferring_cuda():
+    assert select_device(prefer_cuda=False) == torch.device("cpu")
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_vram.py -v -k headroom or ladder or choose or fits`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_vram.py -v -k headroom or choose or fits or select_device`
 Expected: FAIL with `ImportError: cannot import name 'HEADROOM_BYTES'`
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add to `src/enhancer/vram.py`:
+Add to `src/enhancer/vram.py` (no new import lines):
 
 ```python
-# Descending ladder of candidate tile sizes (spec §8 step 1).
-TILE_LADDER: tuple[int, ...] = (1024, 768, 512, 384, 256, 192, 128)
-
 # Reserved VRAM. A laptop GPU also drives the desktop compositor under WDDM,
-# so this is deliberately generous (spec §8).
+# so this is deliberately generous.
 HEADROOM_BYTES: int = 1024 ** 3
 
 
-def choose_tile(free_bytes: int, bytes_per_pixel: int) -> int:
-    """Pick the largest ladder tile whose working set fits the VRAM budget."""
+def choose_tile(
+    free_bytes: int,
+    bytes_per_output_pixel: int,
+    overlap: int = 0,
+    scale: int = 1,
+) -> int:
+    """Pick the largest ladder tile whose working set fits the VRAM budget.
+
+    The cost model uses the PADDED tile area, because that is what actually gets
+    fed to the model, and scales by `scale**2`, because a 4x model produces 16x
+    the pixels. `bytes_per_output_pixel` is a per-output-pixel constant obtained
+    by calibration; it must NOT already include the scale factor.
+    """
+    if scale <= 0:
+        raise ValueError(f"scale must be positive, got {scale}")
     budget = max(0, free_bytes - HEADROOM_BYTES)
     for tile in TILE_LADDER:
-        if tile * tile * bytes_per_pixel <= budget:
+        padded = tile + 2 * overlap
+        if padded * padded * bytes_per_output_pixel * scale * scale <= budget:
             return tile
     return TILE_LADDER[-1]
 
@@ -697,7 +995,7 @@ def select_device(prefer_cuda: bool = True) -> torch.device:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_vram.py -v`
-Expected: 20 passed
+Expected: 33 passed
 
 - [ ] **Step 5: Commit**
 
@@ -1964,20 +2262,20 @@ from .upscale import Upscaler
 from .video_io import Decoder, Encoder, SourceProfile
 from .vram import choose_tile, free_vram_bytes, select_device
 
-DEFAULT_BYTES_PER_PIXEL = 64
+DEFAULT_BYTES_PER_OUTPUT_PIXEL = 64
 
 
-def _auto_tile() -> int:
+def _auto_tile(scale: int, overlap: int) -> int:
     free = free_vram_bytes()
     if free == 0:
         return 256
-    return choose_tile(free, DEFAULT_BYTES_PER_PIXEL)
+    return choose_tile(free, DEFAULT_BYTES_PER_OUTPUT_PIXEL, overlap=overlap, scale=scale)
 
 
 def cmd_bench(args: argparse.Namespace) -> int:
     device = select_device(prefer_cuda=not args.cpu)
     model = load_model(Path(args.model), device=device, half=not args.cpu)
-    tile = args.tile or _auto_tile()
+    tile = args.tile or _auto_tile(model.scale, args.overlap)
     result = benchmark(
         model, width=args.width, height=args.height, frames=args.frames,
         tile=tile, overlap=args.overlap, device=str(device), half=not args.cpu,
@@ -1989,7 +2287,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
 def cmd_video(args: argparse.Namespace) -> int:
     device = select_device(prefer_cuda=not args.cpu)
     model = load_model(Path(args.model), device=device, half=not args.cpu)
-    tile = args.tile or _auto_tile()
+    tile = args.tile or _auto_tile(model.scale, args.overlap)
 
     profile = SourceProfile.probe(args.input)
     up = Upscaler(model, tile=tile, overlap=args.overlap, device=device, half=not args.cpu)

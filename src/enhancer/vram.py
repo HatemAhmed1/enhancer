@@ -2,7 +2,59 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
+
+import torch
+
+log = logging.getLogger(__name__)
+
+InferFn = Callable[[torch.Tensor], torch.Tensor]
+
+# Descending ladder of candidate tile sizes. Used for stepping in BOTH
+# directions so that shrink and recover are symmetric.
+TILE_LADDER: tuple[int, ...] = (1024, 768, 512, 384, 256, 192, 128)
+
+# Reserved VRAM. A laptop GPU also drives the desktop compositor under WDDM,
+# so this is deliberately generous.
+HEADROOM_BYTES: int = 1024 ** 3
+
+# Upper bound on the success-probe backoff, so probes stay rare but never stop.
+MAX_PROBE_INTERVAL: int = 8192
+
+# Substrings identifying a RECOVERABLE allocation failure. Deliberately narrow:
+# "CUDA error: an illegal memory access" is unrecoverable and must NOT match,
+# because retrying it forever would hide a real bug.
+_OOM_MARKERS: tuple[str, ...] = (
+    "out of memory",
+    "alloc_failed",
+    "cuda_error_out_of_memory",
+)
+
+
+def is_oom_error(exc: BaseException) -> bool:
+    """True if `exc` is a recoverable allocation failure.
+
+    CUDA exhaustion does not always arrive as torch.cuda.OutOfMemoryError.
+    cuDNN and cuBLAS workspace allocation and driver-level failures surface as
+    a plain RuntimeError, and the CPU fallback path raises MemoryError. Catching
+    only the typed error lets a real OOM kill a multi-hour render.
+    """
+    if isinstance(exc, (torch.cuda.OutOfMemoryError, MemoryError)):
+        return True
+    if isinstance(exc, RuntimeError):
+        message = str(exc).lower()
+        return any(marker in message for marker in _OOM_MARKERS)
+    return False
+
+
+class TileFloorReached(Exception):
+    """Tiling cannot make this frame fit. The caller should fall back to CPU.
+
+    Deliberately NOT a RuntimeError subclass: TileRunner widens its except
+    clause to RuntimeError, and this signal must pass through it uncaught.
+    """
 
 
 @dataclass(frozen=True)
@@ -54,11 +106,42 @@ def plan_tiles(h: int, w: int, tile: int, overlap: int) -> list[Tile]:
     return tiles
 
 
-from collections.abc import Callable
+def _check_scale(out: torch.Tensor, inp: torch.Tensor, scale: int) -> None:
+    """Verify the model actually upscaled by `scale`.
 
-import torch
+    Without this, a mismatch (e.g. a 4x model driven with scale=2) slices
+    successfully and writes scrambled pixels with no error at all.
+    """
+    expected = (inp.shape[-2] * scale, inp.shape[-1] * scale)
+    actual = tuple(out.shape[-2:])
+    if actual != expected:
+        raise ValueError(
+            f"model returned {actual} for a {tuple(inp.shape[-2:])} input; "
+            f"expected {expected} at scale={scale}"
+        )
 
-InferFn = Callable[[torch.Tensor], torch.Tensor]
+
+def _alloc_output(sample: torch.Tensor, h: int, w: int, scale: int) -> torch.Tensor:
+    """Allocate the full output buffer, attributing its failure correctly.
+
+    This buffer's size depends only on h, w and scale, so shrinking tiles cannot
+    make it fit. Reporting it as TileFloorReached sends the caller straight to
+    the CPU fallback instead of burning several pointless halving rounds and
+    then blaming the tile size.
+    """
+    try:
+        return torch.empty(
+            (sample.shape[0], sample.shape[1], h * scale, w * scale),
+            dtype=sample.dtype,
+            device=sample.device,
+        )
+    except Exception as exc:
+        if is_oom_error(exc):
+            raise TileFloorReached(
+                f"output buffer {h * scale}x{w * scale} does not fit in memory; "
+                f"tiling cannot reduce it"
+            ) from exc
+        raise
 
 
 def run_tiled(
@@ -75,12 +158,19 @@ def run_tiled(
     """
     if img.ndim != 4:
         raise ValueError(f"expected a 4-D (B, C, H, W) tensor, got shape {tuple(img.shape)}")
+    if scale <= 0:
+        raise ValueError(f"scale must be positive, got {scale}")
 
     _, _, h, w = img.shape
+    if h <= 0 or w <= 0:
+        raise ValueError(f"image has a zero dimension: {h}x{w}")
+
     tiles = plan_tiles(h, w, tile, overlap)
 
     if len(tiles) == 1:
-        return fn(img)
+        out = fn(img)
+        _check_scale(out, img, scale)
+        return out
 
     out: torch.Tensor | None = None
     for t in tiles:
@@ -88,10 +178,8 @@ def run_tiled(
         up = fn(patch)
 
         if out is None:
-            b, c = up.shape[0], up.shape[1]
-            out = torch.empty(
-                (b, c, h * scale, w * scale), dtype=up.dtype, device=up.device
-            )
+            _check_scale(up, patch, scale)
+            out = _alloc_output(up, h, w, scale)
 
         # Offset of the core within the padded patch, in output pixels.
         oy = (t.y0 - t.py0) * scale
@@ -107,20 +195,16 @@ def run_tiled(
     return out
 
 
-import logging
-
-log = logging.getLogger(__name__)
-
-
-class TileFloorReached(RuntimeError):
-    """Raised when even the smallest tile cannot fit in VRAM.
-
-    Callers should fall back to CPU for this frame (spec §8 step 3).
-    """
-
-
 class TileRunner:
-    """Runs tiled inference, shrinking tiles on OOM and recovering afterwards."""
+    """Runs tiled inference, shrinking tiles on OOM and probing back upward.
+
+    On an allocation failure the tile steps down the ladder and the frame is
+    retried. After sustained success the runner probes a larger tile again, with
+    the probe interval doubling after each failure. That converges: a size that
+    genuinely does not fit is retried a handful of times over a long render
+    rather than every `recover_after` frames forever, while a transient spike
+    from another application still recovers.
+    """
 
     def __init__(
         self,
@@ -136,22 +220,40 @@ class TileRunner:
         self.scale = scale
         self.min_tile = min_tile
         self.recover_after = recover_after
+        self._probe_interval = recover_after
         self._successes = 0
+
+    def _step_down(self, tile: int) -> int:
+        for rung in TILE_LADDER:
+            if rung < tile:
+                return max(self.min_tile, rung)
+        return self.min_tile
+
+    def _step_up(self, tile: int) -> int:
+        for rung in reversed(TILE_LADDER):
+            if rung > tile:
+                return rung
+        return tile
 
     def run(self, fn: InferFn, img: torch.Tensor) -> torch.Tensor:
         while True:
             try:
                 out = run_tiled(fn, img, self.tile, self.overlap, self.scale)
-            except torch.cuda.OutOfMemoryError:
+            except TileFloorReached:
+                raise
+            except Exception as exc:
+                if not is_oom_error(exc):
+                    raise
                 self._successes = 0
+                self._probe_interval = min(self._probe_interval * 2, MAX_PROBE_INTERVAL)
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 if self.tile <= self.min_tile:
                     raise TileFloorReached(
-                        f"OOM at minimum tile size {self.min_tile}"
-                    ) from None
-                self.tile = max(self.min_tile, self.tile // 2)
-                log.warning("CUDA OOM; retrying frame at tile=%d", self.tile)
+                        f"allocation failed at minimum tile size {self.min_tile}"
+                    ) from exc
+                self.tile = self._step_down(self.tile)
+                log.warning("Allocation failure; retrying frame at tile=%d", self.tile)
                 continue
 
             self._note_success()
@@ -161,25 +263,31 @@ class TileRunner:
         if self.tile >= self.max_tile:
             return
         self._successes += 1
-        if self._successes >= self.recover_after:
-            self.tile = min(self.max_tile, self.tile * 2)
+        if self._successes >= self._probe_interval:
+            self.tile = min(self.max_tile, self._step_up(self.tile))
             self._successes = 0
-            log.info("VRAM pressure eased; tile size raised to %d", self.tile)
+            log.info("VRAM pressure eased; probing tile size %d", self.tile)
 
 
-# Descending ladder of candidate tile sizes (spec §8 step 1).
-TILE_LADDER: tuple[int, ...] = (1024, 768, 512, 384, 256, 192, 128)
+def choose_tile(
+    free_bytes: int,
+    bytes_per_output_pixel: int,
+    overlap: int = 0,
+    scale: int = 1,
+) -> int:
+    """Pick the largest ladder tile whose working set fits the VRAM budget.
 
-# Reserved VRAM. A laptop GPU also drives the desktop compositor under WDDM,
-# so this is deliberately generous (spec §8).
-HEADROOM_BYTES: int = 1024 ** 3
-
-
-def choose_tile(free_bytes: int, bytes_per_pixel: int) -> int:
-    """Pick the largest ladder tile whose working set fits the VRAM budget."""
+    The cost model uses the PADDED tile area, because that is what actually gets
+    fed to the model, and scales by `scale**2`, because a 4x model produces 16x
+    the pixels. `bytes_per_output_pixel` is a per-output-pixel constant obtained
+    by calibration; it must NOT already include the scale factor.
+    """
+    if scale <= 0:
+        raise ValueError(f"scale must be positive, got {scale}")
     budget = max(0, free_bytes - HEADROOM_BYTES)
     for tile in TILE_LADDER:
-        if tile * tile * bytes_per_pixel <= budget:
+        padded = tile + 2 * overlap
+        if padded * padded * bytes_per_output_pixel * scale * scale <= budget:
             return tile
     return TILE_LADDER[-1]
 
