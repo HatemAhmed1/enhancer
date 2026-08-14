@@ -36,6 +36,24 @@
       "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
       "sha256": "49fafd45f8fd7aa8d31ab2a22d14d91b536c34494a5cfe31eb5d89c2fa266abb",
       "size": 67061725
+    },
+    {
+      "id": "2xParimgCompact",
+      "tier": "turbo",
+      "arch": "RealESRGAN Compact",
+      "scale": 2,
+      "url": "https://objectstorage.us-phoenix-1.oraclecloud.com/n/ax6ygfvpvzka/b/open-modeldb-files/o/2x-ParimgCompact.pth",
+      "sha256": "405f8ce5b18ff23107028657c00687c7d27d74976a8999fab39f7c02680b1164",
+      "size": 2419014
+    },
+    {
+      "id": "2xModernSpanimationV1",
+      "tier": "fast",
+      "arch": "SPAN",
+      "scale": 2,
+      "url": "https://github.com/TNTwise/Models/releases/download/2x_ModernSpanimationV1/2x_ModernSpanimationV1.pth",
+      "sha256": "bc6ca08ab1eeb9884a5c43c025eda97a5aa9ccfaa567734f426aedf55cf78327",
+      "size": 15830922
     }
   ]
 }
