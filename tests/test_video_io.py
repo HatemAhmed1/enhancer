@@ -100,3 +100,35 @@ def test_encoder_scales_output_dimensions(tmp_path, synthetic_clip):
             enc.write(np.repeat(np.repeat(frame, 2, axis=0), 2, axis=1))
     result = SourceProfile.probe(out)
     assert result.width == 640 and result.height == 480
+
+
+def test_decoder_start_frame_skips_leading_frames(synthetic_clip):
+    p = SourceProfile.probe(synthetic_clip)
+    all_frames = list(Decoder(p).frames())
+    seeked = list(Decoder(p, start_frame=10).frames())
+    assert len(seeked) == len(all_frames) - 10
+
+
+def test_decoder_start_frame_lands_on_the_right_frame(synthetic_clip):
+    p = SourceProfile.probe(synthetic_clip)
+    all_frames = list(Decoder(p).frames())
+    seeked = list(Decoder(p, start_frame=10).frames())
+    assert np.array_equal(seeked[0], all_frames[10])
+
+
+def test_decoder_max_frames_limits_output(synthetic_clip):
+    p = SourceProfile.probe(synthetic_clip)
+    assert len(list(Decoder(p, max_frames=7).frames())) == 7
+
+
+def test_decoder_start_and_max_select_a_window(synthetic_clip):
+    p = SourceProfile.probe(synthetic_clip)
+    all_frames = list(Decoder(p).frames())
+    window = list(Decoder(p, start_frame=20, max_frames=5).frames())
+    assert len(window) == 5
+    assert np.array_equal(window[0], all_frames[20])
+
+
+def test_decoder_start_frame_zero_matches_no_seek(synthetic_clip):
+    p = SourceProfile.probe(synthetic_clip)
+    assert len(list(Decoder(p, start_frame=0).frames())) == 50

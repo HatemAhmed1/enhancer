@@ -90,20 +90,41 @@ def _parse_probe(raw: dict) -> SourceProfile:
 
 
 class Decoder:
-    """Streams RGB24 frames from ffmpeg over a pipe. Never touches disk."""
+    """Streams RGB24 frames from ffmpeg over a pipe. Never touches disk.
 
-    def __init__(self, profile: SourceProfile) -> None:
+    `start_frame` seeks before decoding, which is what makes resume cheap: an
+    interrupted render at hour ten does not re-process the first ten hours.
+    """
+
+    def __init__(
+        self,
+        profile: SourceProfile,
+        start_frame: int = 0,
+        max_frames: int | None = None,
+    ) -> None:
         self.profile = profile
+        self.start_frame = start_frame
+        self.max_frames = max_frames
+
+    def _command(self) -> list[str]:
+        p = self.profile
+        cmd = ["ffmpeg", "-v", "error", "-nostdin"]
+        if self.start_frame > 0 and p.fps > 0:
+            # Input-side seek: fast, and accurate in modern ffmpeg because it
+            # decodes from the preceding keyframe and discards internally.
+            cmd += ["-ss", f"{self.start_frame / p.fps:.6f}"]
+        cmd += ["-i", str(p.path)]
+        if self.max_frames is not None:
+            cmd += ["-frames:v", str(self.max_frames)]
+        cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+        return cmd
 
     def frames(self) -> Iterator[np.ndarray]:
         p = self.profile
         frame_bytes = p.width * p.height * 3
-        cmd = [
-            "ffmpeg", "-v", "error", "-nostdin",
-            "-i", str(p.path),
-            "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
-        ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=frame_bytes * 4)
+        proc = subprocess.Popen(
+            self._command(), stdout=subprocess.PIPE, bufsize=frame_bytes * 4
+        )
         try:
             while True:
                 buf = proc.stdout.read(frame_bytes)
