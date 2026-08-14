@@ -1,6 +1,7 @@
+import numpy as np
 import pytest
 
-from enhancer.video_io import SourceProfile, _parse_probe, _parse_fraction
+from enhancer.video_io import Decoder, Encoder, SourceProfile, _parse_probe, _parse_fraction
 
 
 def test_parse_fraction_handles_rationals():
@@ -55,3 +56,47 @@ def test_probe_real_clip(synthetic_clip):
     assert p.width == 320 and p.height == 240
     assert p.fps == pytest.approx(25.0)
     assert p.interlaced is False
+
+
+def test_decoder_yields_correct_shape_and_count(synthetic_clip):
+    p = SourceProfile.probe(synthetic_clip)
+    frames = list(Decoder(p).frames())
+    assert len(frames) == 50, "2 seconds at 25 fps"
+    assert frames[0].shape == (240, 320, 3)
+    assert frames[0].dtype == np.uint8
+
+
+def test_decoder_frames_are_not_all_identical(synthetic_clip):
+    p = SourceProfile.probe(synthetic_clip)
+    frames = list(Decoder(p).frames())
+    assert not np.array_equal(frames[0], frames[-1])
+
+
+def test_encoder_writes_playable_file(tmp_path, synthetic_clip):
+    p = SourceProfile.probe(synthetic_clip)
+    out = tmp_path / "out.mp4"
+    with Encoder(out, width=320, height=240, fps=25.0, source=p) as enc:
+        for frame in Decoder(p).frames():
+            enc.write(frame)
+    assert out.exists() and out.stat().st_size > 0
+    result = SourceProfile.probe(out)
+    assert result.width == 320 and result.height == 240
+
+
+def test_encode_roundtrip_preserves_frame_count(tmp_path, synthetic_clip):
+    p = SourceProfile.probe(synthetic_clip)
+    out = tmp_path / "out.mp4"
+    with Encoder(out, width=320, height=240, fps=25.0, source=p) as enc:
+        for frame in Decoder(p).frames():
+            enc.write(frame)
+    assert len(list(Decoder(SourceProfile.probe(out)).frames())) == 50
+
+
+def test_encoder_scales_output_dimensions(tmp_path, synthetic_clip):
+    p = SourceProfile.probe(synthetic_clip)
+    out = tmp_path / "big.mp4"
+    with Encoder(out, width=640, height=480, fps=25.0, source=p) as enc:
+        for frame in Decoder(p).frames():
+            enc.write(np.repeat(np.repeat(frame, 2, axis=0), 2, axis=1))
+    result = SourceProfile.probe(out)
+    assert result.width == 640 and result.height == 480
