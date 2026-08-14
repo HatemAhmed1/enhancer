@@ -105,3 +105,63 @@ def run_tiled(
 
     assert out is not None
     return out
+
+
+import logging
+
+log = logging.getLogger(__name__)
+
+
+class TileFloorReached(RuntimeError):
+    """Raised when even the smallest tile cannot fit in VRAM.
+
+    Callers should fall back to CPU for this frame (spec §8 step 3).
+    """
+
+
+class TileRunner:
+    """Runs tiled inference, shrinking tiles on OOM and recovering afterwards."""
+
+    def __init__(
+        self,
+        tile: int,
+        overlap: int,
+        scale: int,
+        min_tile: int = 128,
+        recover_after: int = 64,
+    ) -> None:
+        self.tile = tile
+        self.max_tile = tile
+        self.overlap = overlap
+        self.scale = scale
+        self.min_tile = min_tile
+        self.recover_after = recover_after
+        self._successes = 0
+
+    def run(self, fn: InferFn, img: torch.Tensor) -> torch.Tensor:
+        while True:
+            try:
+                out = run_tiled(fn, img, self.tile, self.overlap, self.scale)
+            except torch.cuda.OutOfMemoryError:
+                self._successes = 0
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if self.tile <= self.min_tile:
+                    raise TileFloorReached(
+                        f"OOM at minimum tile size {self.min_tile}"
+                    ) from None
+                self.tile = max(self.min_tile, self.tile // 2)
+                log.warning("CUDA OOM; retrying frame at tile=%d", self.tile)
+                continue
+
+            self._note_success()
+            return out
+
+    def _note_success(self) -> None:
+        if self.tile >= self.max_tile:
+            return
+        self._successes += 1
+        if self._successes >= self.recover_after:
+            self.tile = min(self.max_tile, self.tile * 2)
+            self._successes = 0
+            log.info("VRAM pressure eased; tile size raised to %d", self.tile)

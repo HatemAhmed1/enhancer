@@ -78,3 +78,60 @@ def test_single_tile_path_matches_direct_call():
     img = torch.rand(1, 3, 32, 32)
     out = run_tiled(lambda t: t * 2, img, tile=256, overlap=16, scale=1)
     assert torch.equal(out, img * 2)
+
+
+from enhancer.vram import TileFloorReached, TileRunner
+
+
+def _oom_for_first(n_failures):
+    """Return an infer fn that raises CUDA OOM for the first n calls."""
+    calls = {"n": 0}
+
+    def fn(t):
+        calls["n"] += 1
+        if calls["n"] <= n_failures:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+        return t
+
+    fn.calls = calls
+    return fn
+
+
+def test_halves_tile_on_oom_and_succeeds():
+    runner = TileRunner(tile=256, overlap=0, scale=1, min_tile=32)
+    img = torch.rand(1, 3, 64, 64)
+    out = runner.run(_oom_for_first(1), img)
+    assert torch.equal(out, img)
+    assert runner.tile == 128
+
+
+def test_halves_repeatedly_until_success():
+    runner = TileRunner(tile=256, overlap=0, scale=1, min_tile=32)
+    img = torch.rand(1, 3, 64, 64)
+    runner.run(_oom_for_first(3), img)
+    assert runner.tile == 32
+
+
+def test_raises_tile_floor_reached_when_floor_still_ooms():
+    runner = TileRunner(tile=64, overlap=0, scale=1, min_tile=32)
+    img = torch.rand(1, 3, 64, 64)
+    with pytest.raises(TileFloorReached):
+        runner.run(_oom_for_first(99), img)
+
+
+def test_recovers_tile_size_after_sustained_success():
+    runner = TileRunner(tile=256, overlap=0, scale=1, min_tile=32, recover_after=3)
+    img = torch.rand(1, 3, 64, 64)
+    runner.run(_oom_for_first(1), img)
+    assert runner.tile == 128
+    for _ in range(3):
+        runner.run(lambda t: t, img)
+    assert runner.tile == 256, "tile should step back up after sustained success"
+
+
+def test_recovery_never_exceeds_starting_tile():
+    runner = TileRunner(tile=128, overlap=0, scale=1, min_tile=32, recover_after=1)
+    img = torch.rand(1, 3, 64, 64)
+    for _ in range(10):
+        runner.run(lambda t: t, img)
+    assert runner.tile == 128
