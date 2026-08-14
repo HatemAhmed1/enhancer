@@ -39,3 +39,42 @@ def test_zero_overlap_means_padded_equals_core():
 def test_rejects_nonpositive_tile():
     with pytest.raises(ValueError):
         plan_tiles(h=10, w=10, tile=0, overlap=0)
+
+
+import torch
+from enhancer.vram import run_tiled
+
+
+def test_identity_roundtrip_is_exact_at_zero_overlap():
+    img = torch.rand(1, 3, 200, 300)
+    out = run_tiled(lambda t: t, img, tile=64, overlap=0, scale=1)
+    assert torch.equal(out, img)
+
+
+def test_identity_roundtrip_is_exact_with_overlap():
+    """Exact-crop reassembly must be lossless at any overlap."""
+    img = torch.rand(1, 3, 200, 300)
+    out = run_tiled(lambda t: t, img, tile=64, overlap=16, scale=1)
+    assert torch.equal(out, img)
+
+
+def test_scale_2x_produces_correct_shape():
+    img = torch.rand(1, 3, 100, 150)
+    out = run_tiled(
+        lambda t: torch.nn.functional.interpolate(t, scale_factor=2, mode="nearest"),
+        img, tile=32, overlap=8, scale=2,
+    )
+    assert out.shape == (1, 3, 200, 300)
+
+
+def test_nearest_upscale_matches_untiled_result():
+    img = torch.rand(1, 3, 64, 64)
+    fn = lambda t: torch.nn.functional.interpolate(t, scale_factor=2, mode="nearest")
+    tiled = run_tiled(fn, img, tile=16, overlap=8, scale=2)
+    assert torch.allclose(tiled, fn(img))
+
+
+def test_single_tile_path_matches_direct_call():
+    img = torch.rand(1, 3, 32, 32)
+    out = run_tiled(lambda t: t * 2, img, tile=256, overlap=16, scale=1)
+    assert torch.equal(out, img * 2)

@@ -52,3 +52,56 @@ def plan_tiles(h: int, w: int, tile: int, overlap: int) -> list[Tile]:
                 )
             )
     return tiles
+
+
+from collections.abc import Callable
+
+import torch
+
+InferFn = Callable[[torch.Tensor], torch.Tensor]
+
+
+def run_tiled(
+    fn: InferFn,
+    img: torch.Tensor,
+    tile: int,
+    overlap: int,
+    scale: int,
+) -> torch.Tensor:
+    """Run `fn` over `img` in tiles and reassemble the output.
+
+    `img` is (B, C, H, W). `fn` must upscale by exactly `scale`. Only the core
+    region of each tile's output is written, so reassembly is bit-exact.
+    """
+    if img.ndim != 4:
+        raise ValueError(f"expected a 4-D (B, C, H, W) tensor, got shape {tuple(img.shape)}")
+
+    _, _, h, w = img.shape
+    tiles = plan_tiles(h, w, tile, overlap)
+
+    if len(tiles) == 1:
+        return fn(img)
+
+    out: torch.Tensor | None = None
+    for t in tiles:
+        patch = img[:, :, t.py0:t.py1, t.px0:t.px1]
+        up = fn(patch)
+
+        if out is None:
+            b, c = up.shape[0], up.shape[1]
+            out = torch.empty(
+                (b, c, h * scale, w * scale), dtype=up.dtype, device=up.device
+            )
+
+        # Offset of the core within the padded patch, in output pixels.
+        oy = (t.y0 - t.py0) * scale
+        ox = (t.x0 - t.px0) * scale
+        ch = (t.y1 - t.y0) * scale
+        cw = (t.x1 - t.x0) * scale
+
+        out[:, :, t.y0 * scale:t.y1 * scale, t.x0 * scale:t.x1 * scale] = (
+            up[:, :, oy:oy + ch, ox:ox + cw]
+        )
+
+    assert out is not None
+    return out
