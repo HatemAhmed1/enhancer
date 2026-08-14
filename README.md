@@ -10,6 +10,8 @@ Runs entirely offline. No cloud services, no API keys, no telemetry.
 
 ## Features
 
+- **Texture-preserving** — degrain, upscale, then restore the source's real high-frequency detail and re-grain, so skin reads as photographed rather than polished
+- **Source-aware restoration** — detects interlacing versus 3:2 telecine and applies the correct correction, since getting that wrong damages every frame irreversibly
 - **Resumable** — renders are written as independently complete segments, so an interruption costs at most one segment, not the whole job
 - **Streaming pipeline** — frames move through ffmpeg pipes and never touch disk, avoiding the three-pass PNG cache most tools use
 - **OOM-proof** — adaptive tiling shrinks on memory pressure and falls back to CPU per frame rather than crashing, including on Windows, where the driver oversubscribes silently instead of raising
@@ -102,11 +104,31 @@ More models are listed in `src/enhancer/manifest.json`. Any architecture support
 
 Reports frames per second, peak VRAM, selected tile size, and an estimated time for a two-hour feature.
 
+**Inspect a source before rendering**
+
+```powershell
+.venv\Scripts\python.exe -m enhancer.cli analyze input.mp4
+```
+
+Reports resolution, colour space, sample aspect ratio, scan type, grain level and compression blockiness, then recommends a pre-pass. Worth running on anything from a disc rip — a film-sourced 30i DVD needs inverse telecine, not deinterlacing, and choosing wrong softens every frame permanently.
+
 **Upscale a video**
 
 ```powershell
 .venv\Scripts\python.exe -m enhancer.cli video models\custom\realesr-general-x4v3.pth input.mp4 output.mkv
 ```
+
+Restoration is on by default. Scan correction is chosen automatically from the detected source type.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--degrain` | 0.25 | Noise reduction before upscaling. Deliberately light — grain and skin micro-texture share the same frequencies, so heavy degraining is what produces waxy skin |
+| `--detail-retention` | 0.25 | Blends the source's real high-frequency detail back over the model output. The only stage that restores photographed texture rather than inventing it |
+| `--regrain` | 0.6 | Adds midtone-weighted film grain after upscaling, with a per-frame seed so it moves like film rather than sitting static |
+| `--deblock` | 0.0 | Compression artifact removal. Raise it for YouTube sources and low-bitrate rips |
+| `--no-restore` | off | Skip all restoration and texture work |
+
+Restoration costs roughly 35% throughput. Use `--no-restore` for a fast preview, then render properly.
 
 **Resume an interrupted render**
 
@@ -194,7 +216,7 @@ Run the test suite:
 |---|---|---|
 | Core engine | Tiling, OOM safety, streaming I/O, model loading, benchmarking, YouTube | Complete |
 | Resilience | Resumable renders, physical VRAM ceiling | Complete |
-| Restoration | Deinterlace/IVTC, deblock, degrain, re-grain, detail retention | Planned |
+| Restoration | Deinterlace/IVTC, deblock, degrain, re-grain, detail retention | Complete |
 | Interpolation | RIFE frame interpolation, scene-change detection, target FPS | Planned |
 | Interface | Desktop GUI, dual-pass 2K→4K, segment preview | Planned |
 
