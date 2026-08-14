@@ -98,3 +98,46 @@ class ModelRegistry:
 
     def path_for(self, entry: ModelEntry) -> Path:
         return self.cache_dir / f"{entry.id}.pth"
+
+    def ensure(self, entry: ModelEntry, on_progress: ProgressFn | None = None) -> Path:
+        """Return a verified local path, downloading if necessary."""
+        dest = self.path_for(entry)
+        if dest.exists():
+            try:
+                entry.verify(dest)
+                return dest
+            except VerificationError:
+                dest.unlink()
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _fetch(entry.url, dest, on_progress)
+        try:
+            entry.verify(dest)
+        except VerificationError:
+            dest.unlink(missing_ok=True)
+            raise
+        return dest
+
+
+def scan_custom_dir(directory: Path) -> list[Path]:
+    """Find drop-in weight files (spec §4.1). Missing directory is not an error."""
+    directory = Path(directory)
+    if not directory.is_dir():
+        return []
+    return sorted(
+        p for p in directory.iterdir()
+        if p.is_file() and p.suffix.lower() in CUSTOM_SUFFIXES
+    )
+
+
+def _fetch(url: str, dest: Path, on_progress: ProgressFn | None = None) -> None:
+    """Stream a URL to disk, reporting (bytes_done, bytes_total)."""
+    with urllib.request.urlopen(url) as resp:
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = 0
+        with open(dest, "wb") as fh:
+            while chunk := resp.read(_CHUNK):
+                fh.write(chunk)
+                done += len(chunk)
+                if on_progress:
+                    on_progress(done, total)
