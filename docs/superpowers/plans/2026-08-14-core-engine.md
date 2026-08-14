@@ -441,6 +441,21 @@ def test_single_tile_path_also_validates_scale():
         run_tiled(fn, img, tile=256, overlap=16, scale=2)
 
 
+def test_scale_mismatch_on_edge_tile_raises():
+    """A model that pads its input to a stride multiple returns a different
+    effective scale on small edge tiles than on full-size interior tiles.
+    _check_scale must run on every tile, not just the first, or this
+    silently returns a wrong-shape, wrong-pixel result with no error."""
+    def padding_model(t):
+        h, w = t.shape[-2:]
+        ph, pw = (-h) % 32, (-w) % 32
+        t2 = torch.nn.functional.pad(t, (pw // 2, pw - pw // 2, ph // 2, ph - ph // 2))
+        return torch.nn.functional.interpolate(t2, scale_factor=2, mode="nearest")
+
+    with pytest.raises(ValueError):
+        run_tiled(padding_model, torch.rand(1, 3, 200, 200), tile=64, overlap=0, scale=2)
+
+
 def test_zero_dimension_image_raises_value_error():
     img = torch.rand(1, 3, 0, 64)
     with pytest.raises(ValueError):
@@ -585,9 +600,14 @@ def run_tiled(
     for t in tiles:
         patch = img[:, :, t.py0:t.py1, t.px0:t.px1]
         up = fn(patch)
+        # Validated on EVERY tile, not just the first: edge tiles can be a
+        # different size than interior tiles, and a model that pads its
+        # input to a stride multiple can return a different effective scale
+        # on them. Checking only tile #1 lets that slip through silently
+        # (see test_scale_mismatch_on_edge_tile_raises).
+        _check_scale(up, patch, scale)
 
         if out is None:
-            _check_scale(up, patch, scale)
             out = _alloc_output(up, h, w, scale)
 
         # Offset of the core within the padded patch, in output pixels.
@@ -610,7 +630,7 @@ def run_tiled(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_vram.py -v`
-Expected: 17 passed
+Expected: 18 passed
 
 - [ ] **Step 5: Commit**
 
@@ -697,6 +717,45 @@ def test_recovery_never_exceeds_starting_tile():
     for _ in range(10):
         runner.run(lambda t: t, img)
     assert runner.tile == 128
+
+
+def test_step_up_reaches_max_tile_above_ladder_top():
+    """max_tile above the top ladder rung must not strand recovery below it.
+
+    _step_up only ever returns a ladder rung; when max_tile (2048) is above
+    the top rung (1024), stepping up from 1024 must still land on max_tile,
+    not get stuck returning 1024 unchanged forever."""
+    runner = TileRunner(tile=2048, overlap=0, scale=1, min_tile=32, recover_after=1)
+    img = torch.rand(1, 3, 64, 64)
+    runner.run(_oom_for_first(1), img)
+    assert runner.tile == 1024, "the top ladder rung below 2048"
+
+    for _ in range(20):
+        runner.run(lambda t: t, img)
+
+    assert runner.tile == 2048, "should climb all the way back to max_tile, not stick at 1024"
+
+
+def test_probe_interval_doubles_once_per_frame_not_per_retry():
+    """One frame's descent through several ladder rungs is one probe-interval
+    doubling, not one per retry. Otherwise a single transient spike that
+    forces several step-downs inflates the recovery interval by 2**n instead
+    of 2**1, making the runner recover orders of magnitude slower than
+    recover_after implies."""
+    calls = {"n": 0}
+
+    def fn(t):
+        calls["n"] += 1
+        if calls["n"] <= 4:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+        return t
+
+    runner = TileRunner(tile=1024, overlap=0, scale=1, min_tile=32, recover_after=5)
+    img = torch.rand(1, 3, 64, 64)
+    runner.run(fn, img)
+
+    assert calls["n"] == 5, "sanity: 4 OOM retries then a success, all within one run() call"
+    assert runner._probe_interval == 10, "doubled exactly once, not once per retry (2**4=80)"
 
 
 def test_runner_recovers_from_plain_runtime_error_oom():
@@ -807,9 +866,17 @@ class TileRunner:
         for rung in reversed(TILE_LADDER):
             if rung > tile:
                 return rung
-        return tile
+        # No ladder rung is above `tile`, but max_tile can still be — e.g.
+        # TileRunner(tile=2048, ...) after one OOM drops to the ladder top
+        # (1024). Returning `tile` unchanged here would strand recovery at
+        # 1024 forever instead of climbing back to 2048.
+        return self.max_tile
 
     def run(self, fn: InferFn, img: torch.Tensor) -> torch.Tensor:
+        # Doubles at most once per call: an OOM'd frame can retry through
+        # several ladder rungs before it fits, and that is still a single
+        # transient event, not one probe-interval doubling per retry.
+        doubled_this_call = False
         while True:
             try:
                 out = run_tiled(fn, img, self.tile, self.overlap, self.scale)
@@ -819,7 +886,9 @@ class TileRunner:
                 if not is_oom_error(exc):
                     raise
                 self._successes = 0
-                self._probe_interval = min(self._probe_interval * 2, MAX_PROBE_INTERVAL)
+                if not doubled_this_call:
+                    self._probe_interval = min(self._probe_interval * 2, MAX_PROBE_INTERVAL)
+                    doubled_this_call = True
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 if self.tile <= self.min_tile:
@@ -846,7 +915,7 @@ class TileRunner:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_vram.py -v`
-Expected: 25 passed
+Expected: 28 passed
 
 - [ ] **Step 5: Commit**
 
@@ -995,7 +1064,7 @@ def select_device(prefer_cuda: bool = True) -> torch.device:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_vram.py -v`
-Expected: 33 passed
+Expected: 36 passed
 
 - [ ] **Step 5: Commit**
 

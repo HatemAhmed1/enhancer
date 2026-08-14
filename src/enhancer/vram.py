@@ -176,9 +176,9 @@ def run_tiled(
     for t in tiles:
         patch = img[:, :, t.py0:t.py1, t.px0:t.px1]
         up = fn(patch)
+        _check_scale(up, patch, scale)
 
         if out is None:
-            _check_scale(up, patch, scale)
             out = _alloc_output(up, h, w, scale)
 
         # Offset of the core within the padded patch, in output pixels.
@@ -233,9 +233,13 @@ class TileRunner:
         for rung in reversed(TILE_LADDER):
             if rung > tile:
                 return rung
-        return tile
+        return self.max_tile
 
     def run(self, fn: InferFn, img: torch.Tensor) -> torch.Tensor:
+        # Doubles at most once per call: an OOM'd frame can retry through
+        # several ladder rungs before it fits, and that is still a single
+        # transient event, not one probe-interval doubling per retry.
+        doubled_this_call = False
         while True:
             try:
                 out = run_tiled(fn, img, self.tile, self.overlap, self.scale)
@@ -245,7 +249,9 @@ class TileRunner:
                 if not is_oom_error(exc):
                     raise
                 self._successes = 0
-                self._probe_interval = min(self._probe_interval * 2, MAX_PROBE_INTERVAL)
+                if not doubled_this_call:
+                    self._probe_interval = min(self._probe_interval * 2, MAX_PROBE_INTERVAL)
+                    doubled_this_call = True
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 if self.tile <= self.min_tile:

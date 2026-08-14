@@ -108,6 +108,22 @@ def test_single_tile_path_also_validates_scale():
         run_tiled(fn, img, tile=256, overlap=16, scale=2)
 
 
+def test_scale_mismatch_on_edge_tile_raises():
+    """A model that pads its input to a stride multiple returns a different
+    effective scale on small edge tiles than on full-size interior tiles.
+    _check_scale must run on every tile, not just the first, or this
+    silently returns a wrong-shape, wrong-pixel result with no error.
+    """
+    def padding_model(t):
+        h, w = t.shape[-2:]
+        ph, pw = (-h) % 32, (-w) % 32
+        t2 = torch.nn.functional.pad(t, (pw // 2, pw - pw // 2, ph // 2, ph - ph // 2))
+        return torch.nn.functional.interpolate(t2, scale_factor=2, mode="nearest")
+
+    with pytest.raises(ValueError):
+        run_tiled(padding_model, torch.rand(1, 3, 200, 200), tile=64, overlap=0, scale=2)
+
+
 def test_zero_dimension_image_raises_value_error():
     img = torch.rand(1, 3, 0, 64)
     with pytest.raises(ValueError):
@@ -181,6 +197,47 @@ def test_recovery_never_exceeds_starting_tile():
     for _ in range(10):
         runner.run(lambda t: t, img)
     assert runner.tile == 128
+
+
+def test_step_up_reaches_max_tile_above_ladder_top():
+    """max_tile above the top ladder rung must not strand recovery below it.
+
+    _step_up only ever returns a ladder rung; when max_tile (2048) is above
+    the top rung (1024), stepping up from 1024 must still land on max_tile,
+    not get stuck returning 1024 unchanged forever.
+    """
+    runner = TileRunner(tile=2048, overlap=0, scale=1, min_tile=32, recover_after=1)
+    img = torch.rand(1, 3, 64, 64)
+    runner.run(_oom_for_first(1), img)
+    assert runner.tile == 1024, "the top ladder rung below 2048"
+
+    for _ in range(20):
+        runner.run(lambda t: t, img)
+
+    assert runner.tile == 2048, "should climb all the way back to max_tile, not stick at 1024"
+
+
+def test_probe_interval_doubles_once_per_frame_not_per_retry():
+    """One frame's descent through several ladder rungs is one probe-interval
+    doubling, not one per retry. Otherwise a single transient spike that
+    forces several step-downs inflates the recovery interval by 2**n instead
+    of 2**1, making the runner recover orders of magnitude slower than
+    recover_after implies.
+    """
+    calls = {"n": 0}
+
+    def fn(t):
+        calls["n"] += 1
+        if calls["n"] <= 4:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+        return t
+
+    runner = TileRunner(tile=1024, overlap=0, scale=1, min_tile=32, recover_after=5)
+    img = torch.rand(1, 3, 64, 64)
+    runner.run(fn, img)
+
+    assert calls["n"] == 5, "sanity: 4 OOM retries then a success, all within one run() call"
+    assert runner._probe_interval == 10, "doubled exactly once, not once per retry (2**4=80)"
 
 
 def test_is_oom_error_accepts_plain_runtime_error_variants():
