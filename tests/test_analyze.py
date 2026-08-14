@@ -74,3 +74,47 @@ def test_field_order_reports_bff_when_bottom_dominant():
 
 def test_field_order_is_tff_when_top_dominant():
     assert _parse_idet(INTERLACED_OUTPUT).field_order == "tff"
+
+
+import numpy as np
+
+from enhancer.analyze import estimate_blockiness, estimate_grain
+
+
+def test_grain_is_near_zero_for_a_flat_frame():
+    flat = np.full((128, 128, 3), 128, dtype=np.uint8)
+    assert estimate_grain(flat) < 0.5
+
+
+def test_grain_rises_with_added_noise():
+    rng = np.random.default_rng(0)
+    flat = np.full((128, 128, 3), 128, dtype=np.uint8)
+    noisy = np.clip(
+        flat.astype(np.int16) + rng.normal(0, 8, flat.shape), 0, 255
+    ).astype(np.uint8)
+    assert estimate_grain(noisy) > estimate_grain(flat) + 2
+
+
+def test_grain_ignores_smooth_gradients():
+    """A gradient has energy but no grain; the estimator must not confuse them."""
+    ramp = np.tile(np.linspace(0, 255, 128, dtype=np.uint8), (128, 1))
+    frame = np.dstack([ramp] * 3)
+    assert estimate_grain(frame) < 1.0
+
+
+def test_grain_is_deterministic():
+    rng = np.random.default_rng(7)
+    frame = rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)
+    assert estimate_grain(frame) == estimate_grain(frame)
+
+
+def test_blockiness_is_low_for_a_smooth_frame():
+    ramp = np.tile(np.linspace(0, 255, 128, dtype=np.uint8), (128, 1))
+    assert estimate_blockiness(np.dstack([ramp] * 3)) < 1.0
+
+
+def test_blockiness_rises_with_8x8_discontinuities():
+    """Simulate DCT block edges every 8 pixels."""
+    frame = np.full((128, 128, 3), 120, dtype=np.uint8)
+    frame[:, ::8] = 160
+    assert estimate_blockiness(frame) > 3.0

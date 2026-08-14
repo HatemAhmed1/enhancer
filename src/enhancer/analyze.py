@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+import numpy as np
+
 # Fraction of frames showing repeated fields above which a source is treated as
 # telecined rather than interlaced. 3:2 pulldown repeats one field in five.
 TELECINE_REPEAT_RATIO = 0.10
@@ -113,3 +115,60 @@ def probe_scan(path: str | Path, frames: int = IDET_FRAMES) -> FieldAnalysis:
         capture_output=True, text=True,
     )
     return _parse_idet(result.stderr)
+
+
+def _luma(frame: np.ndarray) -> np.ndarray:
+    """Rec. 709 luma as float32."""
+    f = frame.astype(np.float32)
+    return 0.2126 * f[..., 0] + 0.7152 * f[..., 1] + 0.0722 * f[..., 2]
+
+
+def estimate_grain(frame: np.ndarray) -> float:
+    """Estimate grain amplitude, in 0-255 units.
+
+    Measured as the standard deviation of a high-pass residual restricted to
+    locally flat regions. Restricting to flat regions is what separates grain
+    from genuine image detail and from smooth gradients, both of which would
+    otherwise inflate the estimate.
+    """
+    y = _luma(frame)
+
+    # 3x3 box blur via cumulative sums along both axes.
+    pad = np.pad(y, 1, mode="edge")
+    blur = (
+        pad[:-2, :-2] + pad[:-2, 1:-1] + pad[:-2, 2:]
+        + pad[1:-1, :-2] + pad[1:-1, 1:-1] + pad[1:-1, 2:]
+        + pad[2:, :-2] + pad[2:, 1:-1] + pad[2:, 2:]
+    ) / 9.0
+
+    residual = y - blur
+
+    # Local gradient magnitude, used to exclude edges and textured regions.
+    gy = np.abs(np.diff(blur, axis=0, prepend=blur[:1]))
+    gx = np.abs(np.diff(blur, axis=1, prepend=blur[:, :1]))
+    gradient = gy + gx
+
+    flat = gradient < np.percentile(gradient, 40)
+    if not flat.any():
+        return float(residual.std())
+    return float(residual[flat].std())
+
+
+def estimate_blockiness(frame: np.ndarray) -> float:
+    """Estimate DCT block-edge strength, in 0-255 units.
+
+    Compares the mean absolute difference across 8-pixel-aligned column
+    boundaries against non-aligned boundaries. Compression leaves discontinuities
+    on the block grid; natural detail does not prefer that grid.
+    """
+    y = _luma(frame)
+    diffs = np.abs(np.diff(y, axis=1))
+    if diffs.shape[1] < 16:
+        return 0.0
+
+    columns = np.arange(diffs.shape[1])
+    on_grid = (columns + 1) % 8 == 0
+    if not on_grid.any() or on_grid.all():
+        return 0.0
+
+    return float(diffs[:, on_grid].mean() - diffs[:, ~on_grid].mean())
