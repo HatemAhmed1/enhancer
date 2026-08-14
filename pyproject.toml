@@ -11,6 +11,9 @@ dependencies = [
     "yt-dlp",
 ]
 
+[project.scripts]
+enhancer = "enhancer.cli:main"
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

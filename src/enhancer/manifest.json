@@ -1,4 +1,41 @@
 {
-  "_comment": "SHA-256 digests MUST be computed from real downloads (spec §12). Never invent them.",
-  "models": []
+  "_comment": "SHA-256 digests MUST be computed from real downloads (spec \u00a712). Never invent them.",
+  "models": [
+    {
+      "id": "realesr-general-x4v3",
+      "tier": "turbo",
+      "arch": "RealESRGAN Compact",
+      "scale": 4,
+      "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
+      "sha256": "8dc7edb9ac80ccdc30c3a5dca6616509367f05fbc184ad95b731f05bece96292",
+      "size": 4885111
+    },
+    {
+      "id": "4xPurePhoto-span",
+      "tier": "fast",
+      "arch": "SPAN",
+      "scale": 4,
+      "url": "https://github.com/starinspace/StarinspaceUpscale/releases/download/Models/4xPurePhoto-span.pth",
+      "sha256": "c689eec59771ed3eaffc10eea933c44fdb9131f83251c51c5bab4cae7c4d3bf2",
+      "size": 9016490
+    },
+    {
+      "id": "4xNomos2_realplksr_dysample",
+      "tier": "balanced",
+      "arch": "PLKSR",
+      "scale": 4,
+      "url": "https://github.com/Phhofm/models/releases/download/4xNomos2_realplksr_dysample/4xNomos2_realplksr_dysample.pth",
+      "sha256": "96c8476ed2c42107628d10562b32ae89e7be3c2f7a53d29504823e9bafe8121d",
+      "size": 29715988
+    },
+    {
+      "id": "RealESRGAN_x2plus",
+      "tier": "quality",
+      "arch": "ESRGAN",
+      "scale": 2,
+      "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
+      "sha256": "49fafd45f8fd7aa8d31ab2a22d14d91b536c34494a5cfe31eb5d89c2fa266abb",
+      "size": 67061725
+    }
+  ]
 }
