@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
+import torch.nn.functional as F
+
 from .analyze import ScanType
 
 # Maximum hqdn3d strengths at degrain=1.0. Temporal is allowed to go
@@ -75,3 +78,48 @@ def build_filter_chain(
         )
 
     return ",".join(filters)
+
+
+def gaussian_blur(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Separable Gaussian blur on an (N, C, H, W) tensor."""
+    radius = max(1, int(round(3.0 * sigma)))
+    taps = torch.arange(-radius, radius + 1, dtype=x.dtype, device=x.device)
+    kernel = torch.exp(-(taps ** 2) / (2.0 * sigma ** 2))
+    kernel = kernel / kernel.sum()
+
+    channels = x.shape[1]
+    horizontal = kernel.view(1, 1, 1, -1).expand(channels, 1, 1, -1)
+    vertical = kernel.view(1, 1, -1, 1).expand(channels, 1, -1, 1)
+
+    x = F.pad(x, (radius, radius, 0, 0), mode="reflect")
+    x = F.conv2d(x, horizontal, groups=channels)
+    x = F.pad(x, (0, 0, radius, radius), mode="reflect")
+    return F.conv2d(x, vertical, groups=channels)
+
+
+def apply_detail_retention(
+    output: torch.Tensor,
+    source: torch.Tensor,
+    alpha: float,
+    sigma: float = 1.0,
+) -> torch.Tensor:
+    """Blend the source's real high-frequency detail over the model output.
+
+    Every other stage in this pipeline either preserves information or invents
+    it. This one restores genuinely photographed micro-texture: the residual is
+    derived from the source, so it can only contain detail that was actually
+    captured. That is precisely why it cannot fabricate pores, and precisely why
+    it is the most direct answer to the requirement that skin not look polished.
+
+    `output` is (N, C, H, W) in [0, 1]. `source` is the pre-upscale frame in the
+    same layout at lower resolution.
+    """
+    _check("alpha", alpha)
+    if alpha == 0.0:
+        return output
+
+    reference = F.interpolate(
+        source, size=output.shape[-2:], mode="bicubic", align_corners=False
+    )
+    residual = reference - gaussian_blur(reference, sigma)
+    return (output + alpha * residual).clamp_(0.0, 1.0)

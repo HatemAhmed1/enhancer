@@ -88,3 +88,72 @@ def test_strength_out_of_range_is_rejected():
             ScanType.PROGRESSIVE, field_order="tff",
             settings=RestoreSettings(deblock=2.0, degrain=0.0),
         )
+
+
+import numpy as np
+import torch
+
+from enhancer.restore import apply_detail_retention, gaussian_blur
+
+
+def test_gaussian_blur_preserves_shape():
+    x = torch.rand(1, 3, 32, 48)
+    assert gaussian_blur(x, sigma=1.5).shape == x.shape
+
+
+def test_gaussian_blur_reduces_high_frequency_energy():
+    x = torch.rand(1, 3, 64, 64)
+    blurred = gaussian_blur(x, sigma=2.0)
+    assert blurred.var() < x.var()
+
+
+def test_gaussian_blur_leaves_a_constant_image_unchanged():
+    x = torch.full((1, 3, 32, 32), 0.5)
+    assert torch.allclose(gaussian_blur(x, sigma=2.0), x, atol=1e-5)
+
+
+def test_alpha_zero_returns_model_output_unchanged():
+    source = torch.rand(1, 3, 16, 16)
+    output = torch.rand(1, 3, 32, 32)
+    result = apply_detail_retention(output, source, alpha=0.0)
+    assert torch.equal(result, output)
+
+
+def test_detail_retention_adds_high_frequency_energy():
+    """The residual must actually reach the output."""
+    rng = torch.Generator().manual_seed(0)
+    source = torch.rand(1, 3, 32, 32, generator=rng)
+    output = gaussian_blur(
+        torch.nn.functional.interpolate(source, scale_factor=2, mode="bicubic"),
+        sigma=2.0,
+    )
+    enhanced = apply_detail_retention(output, source, alpha=0.5)
+    assert enhanced.var() > output.var()
+
+
+def test_detail_retention_output_stays_in_range():
+    source = torch.rand(1, 3, 16, 16)
+    output = torch.rand(1, 3, 32, 32)
+    result = apply_detail_retention(output, source, alpha=1.0)
+    assert float(result.min()) >= 0.0
+    assert float(result.max()) <= 1.0
+
+
+def test_detail_retention_is_deterministic():
+    source = torch.rand(1, 3, 16, 16)
+    output = torch.rand(1, 3, 32, 32)
+    a = apply_detail_retention(output, source, alpha=0.4)
+    b = apply_detail_retention(output, source, alpha=0.4)
+    assert torch.equal(a, b)
+
+
+def test_detail_retention_rejects_alpha_out_of_range():
+    with pytest.raises(ValueError):
+        apply_detail_retention(torch.rand(1, 3, 8, 8), torch.rand(1, 3, 4, 4), alpha=1.5)
+
+
+def test_detail_retention_handles_non_integer_scale():
+    """Source and output need not differ by a whole-number factor."""
+    source = torch.rand(1, 3, 17, 23)
+    output = torch.rand(1, 3, 40, 55)
+    assert apply_detail_retention(output, source, alpha=0.3).shape == output.shape
