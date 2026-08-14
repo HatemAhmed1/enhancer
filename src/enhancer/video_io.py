@@ -129,6 +129,7 @@ class Encoder:
         codec: str = "hevc_nvenc",
         quality: int = 20,
         bit_depth: int = 10,
+        mux_audio: bool = True,
     ) -> None:
         self.path = Path(path)
         self.width = width
@@ -138,6 +139,7 @@ class Encoder:
         self.codec = codec
         self.quality = quality
         self.bit_depth = bit_depth
+        self.mux_audio = mux_audio
         self._proc: subprocess.Popen | None = None
 
     def _build_command(self) -> list[str]:
@@ -148,10 +150,20 @@ class Encoder:
             "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{self.width}x{self.height}", "-r", str(self.fps),
             "-i", "-",
+        ]
+        if self.mux_audio:
             # Second input carries the original audio/subtitle/chapter streams.
-            "-i", str(s.path),
-            "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?",
-            "-c:a", "copy", "-c:s", "copy",
+            # Not used for segmented output: it would attach the *entire*
+            # source audio track to every segment rather than the original's
+            # full-length audio once at final assembly.
+            cmd += [
+                "-i", str(s.path),
+                "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?",
+                "-c:a", "copy", "-c:s", "copy",
+            ]
+        else:
+            cmd += ["-map", "0:v:0"]
+        cmd += [
             "-c:v", self.codec, "-cq", str(self.quality),
             "-pix_fmt", pix_fmt,
         ]
