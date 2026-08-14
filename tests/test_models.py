@@ -1,15 +1,21 @@
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
+import torch
 
 from enhancer.models import (
+    LoadedModel,
     ModelEntry,
     ModelRegistry,
     VerificationError,
+    load_model,
     scan_custom_dir,
     sha256_file,
 )
+
+WEIGHTS_DIR = Path(__file__).parent.parent / "models"
 
 
 def test_sha256_file_matches_hashlib(tmp_path):
@@ -171,3 +177,29 @@ def test_ensure_skips_download_when_file_already_valid(tmp_path, monkeypatch):
 
     monkeypatch.setattr("enhancer.models._fetch", boom)
     assert reg.ensure(entry).read_bytes() == payload
+
+
+@pytest.mark.weights
+def test_load_model_detects_scale_and_arch():
+    candidates = list(WEIGHTS_DIR.glob("*.pth"))
+    if not candidates:
+        pytest.skip("no weights downloaded; run the model manager first")
+    m = load_model(candidates[0], device="cpu", half=False)
+    assert isinstance(m, LoadedModel)
+    assert m.scale in (1, 2, 4, 8)
+    assert m.arch
+
+
+@pytest.mark.weights
+def test_loaded_model_upscales_by_declared_scale():
+    candidates = list(WEIGHTS_DIR.glob("*.pth"))
+    if not candidates:
+        pytest.skip("no weights downloaded; run the model manager first")
+    m = load_model(candidates[0], device="cpu", half=False)
+    out = m(torch.rand(1, 3, 32, 32))
+    assert out.shape[-2:] == (32 * m.scale, 32 * m.scale)
+
+
+def test_load_model_rejects_missing_file(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_model(tmp_path / "nope.pth", device="cpu", half=False)

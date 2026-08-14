@@ -141,3 +141,40 @@ def _fetch(url: str, dest: Path, on_progress: ProgressFn | None = None) -> None:
                 done += len(chunk)
                 if on_progress:
                     on_progress(done, total)
+
+
+class LoadedModel:
+    """A spandrel-loaded upscaler ready for inference."""
+
+    def __init__(self, descriptor: ImageModelDescriptor, device: torch.device) -> None:
+        self._d = descriptor
+        self.device = device
+        self.scale = int(descriptor.scale)
+        self.arch = descriptor.architecture.name
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.inference_mode():
+            return self._d(x)
+
+
+def load_model(path: Path, device: str | torch.device = "cuda", half: bool = True) -> LoadedModel:
+    """Load any supported architecture from a bare state dict.
+
+    spandrel deduces the architecture and hyperparameters, so no per-model code
+    is required (spec §4.1).
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"model weights not found: {path}")
+
+    device = torch.device(device)
+    descriptor = ModelLoader().load_from_file(str(path))
+    if not isinstance(descriptor, ImageModelDescriptor):
+        raise ValueError(f"{path.name} is not an image-to-image model")
+
+    descriptor.to(device)
+    if half and device.type == "cuda" and descriptor.supports_half:
+        descriptor.model.half()
+    descriptor.model.to(memory_format=torch.channels_last)
+    descriptor.eval()
+    return LoadedModel(descriptor, device)
