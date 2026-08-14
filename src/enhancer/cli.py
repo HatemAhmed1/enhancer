@@ -92,7 +92,21 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _force_utf8_stdout() -> None:
+    """Make stdout UTF-8 regardless of the Windows console code page.
+
+    Search results routinely carry Tamil, Hindi, and Telugu titles. The default
+    cp1252 console raises UnicodeEncodeError on them, which for this project is
+    the normal case rather than an edge case.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def main(argv: list[str] | None = None) -> int:
+    _force_utf8_stdout()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     parser = argparse.ArgumentParser(prog="enhancer")
     sub = parser.add_subparsers(dest="cmd", required=True)

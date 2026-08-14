@@ -22,19 +22,49 @@ above ~60 ms turns the job into an overnight render.
 **Constraint 2 — texture fidelity.** Skin must not be polished. See §3, which is a design doctrine
 rather than a feature list, and which overrides default choices elsewhere in this document.
 
-### 1.1 Performance targets
+### 1.1 Performance — MEASURED, revision 3
 
-Measured on target hardware, 480p→960p (2x), fp16, upscale stage only:
+Revisions 1 and 2 of this document carried *estimated* targets. Those estimates were wrong and have
+been replaced with numbers measured on the actual RTX 3060 Laptop by the Plan 1 benchmark harness.
+The original estimates are retained in the right-hand column to record the size of the error.
 
-| Tier | Target throughput | 2h feature (est.) |
-|---|---|---|
-| Turbo (Compact) | ≥ 40 fps | ~1.2 h |
-| Fast (SPAN) | ≥ 25 fps | ~1.9 h |
-| Balanced (RealPLKSR) | ≥ 12 fps | ~4 h |
-| Quality (RRDB-ESRGAN) | ≥ 1.5 fps | ~32 h (stills / short clips only) |
+**480p input → 960p (2x), fp16, upscale stage only:**
 
-Acceptance thresholds, not guarantees. The benchmark harness (§11) measures actuals; the GUI shows
-measured fps so a bad configuration is abandoned in minute two rather than discovered at hour six.
+| Tier | Measured | 2h feature | Original estimate |
+|---|---|---|---|
+| Turbo (Compact 2x) | 19.5 fps | ~2.5 h | ≥ 40 fps |
+| Fast (SPAN 2x) | 13.7 fps | ~3.5 h | ≥ 25 fps |
+| Quality (RRDB 2x) | 1.8–2.2 fps | ~21–27 h | ≥ 1.5 fps ✓ |
+
+**1080p input → 4K (2x) — the primary real-world case:**
+
+| Tier | Measured | 2h feature | Peak VRAM |
+|---|---|---|---|
+| Turbo (Compact 2x) | 2.9 fps | **~16.8 h** | 407 MB |
+| Fast (SPAN 2x) | 2.1 fps | **~22.5 h** | 2686 MB |
+| Quality (RRDB 2x) | 0.3 fps | ~155 h | 1138 MB |
+
+**A 1080p→4K feature is an overnight job on this hardware. It is not a 1.5–3 hour job, as
+revisions 1 and 2 claimed.** DVD-era sources (480p/576p) at 2x remain practical at ~2.5–3.5 hours.
+
+**There is no cheap software win available.** Profiling shows the GPU at 95–97% utilization during
+runs, `to_tensor`/`to_frame` conversion at under 5% of frame time, and no fps drift across
+50/100/400-frame runs. The dual-CUDA-stream and pinned-buffer work in §7.1 was the expected
+headroom; it cannot close a 2x gap on an already-saturated GPU. The remaining levers are TensorRT
+or INT8 compilation (§6, plausibly 1.4–1.8x), a lighter architecture, or accepting these numbers.
+
+### 1.1.1 Windows WDDM invalidates part of the §8 OOM design
+
+RealPLKSR at 1080p reported **7855 MB peak allocation on a 6144 MB card**. Windows WDDM silently
+oversubscribed into system-RAM-backed shared GPU memory rather than raising a catchable CUDA OOM.
+`TileRunner` therefore never engaged and CPU fallbacks stayed at zero — the render degraded into a
+very slow path instead of failing loudly and recovering.
+
+§8's design assumes memory exhaustion *raises*. On Windows it sometimes does not. The tile planner
+must additionally enforce a hard allocation ceiling derived from *physical* VRAM rather than relying
+solely on catching OOM. A contributing cause is that `DEFAULT_BYTES_PER_OUTPUT_PIXEL` is not
+dtype-aware, and architectures spandrel reports as `supports_half=False` correctly run fp32 at
+roughly double the activation memory.
 
 ### 1.2 Non-goals
 
