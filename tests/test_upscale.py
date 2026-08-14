@@ -80,3 +80,87 @@ def test_falls_back_to_cpu_when_tile_floor_reached(rng, monkeypatch):
 def test_cpu_fallback_counter_starts_at_zero():
     up = Upscaler(FakeModel(), tile=32, overlap=0, device="cpu")
     assert up.cpu_fallback_count == 0
+
+
+class FakeFloat32Model:
+    """Stands in for a LoadedModel whose spandrel descriptor reported
+    supports_half=False (e.g. PLKSR/RealPLKSR), so its weights are still
+    float32. Raises the real-world error if ever handed a half input, so a
+    failure to gate `half` correctly shows up as a crash, not silently."""
+
+    def __init__(self, scale=2):
+        self.scale = scale
+        self.arch = "FakeFloat32"
+        self.dtype = torch.float32
+        self.device = torch.device("cpu")
+
+    def __call__(self, x):
+        if x.dtype == torch.float16:
+            raise RuntimeError(
+                "Input type (struct c10::Half) and bias type (float) "
+                "should be the same"
+            )
+        return torch.nn.functional.interpolate(x, scale_factor=self.scale, mode="nearest")
+
+    def to(self, device):
+        self.device = torch.device(device)
+        return self
+
+
+class FakeHalfModel:
+    """Stands in for a LoadedModel whose weights were successfully cast to
+    half (supports_half=True), mirroring load_model()'s descriptor.model.half()."""
+
+    def __init__(self, scale=2):
+        self.scale = scale
+        self.arch = "FakeHalf"
+        self.dtype = torch.float16
+        self.device = torch.device("cpu")
+
+    def __call__(self, x):
+        assert x.dtype == torch.float16, f"expected a half input, got {x.dtype}"
+        out = torch.nn.functional.interpolate(x.float(), scale_factor=self.scale, mode="nearest")
+        return out.half()
+
+    def to(self, device):
+        self.device = torch.device(device)
+        return self
+
+
+def test_half_disabled_when_model_weights_are_float32(rng):
+    frame = rng.integers(0, 256, (32, 32, 3), dtype=np.uint8)
+    model = FakeFloat32Model(scale=2)
+    up = Upscaler(model, tile=16, overlap=4, device="cpu", half=True)
+    assert up.half is False
+    out = up.process(frame)  # must not raise
+    assert out.shape == (64, 64, 3)
+
+
+@pytest.mark.gpu
+def test_half_enabled_when_model_weights_are_half(rng):
+    if not torch.cuda.is_available():
+        pytest.skip("requires a CUDA device")
+    frame = rng.integers(0, 256, (32, 32, 3), dtype=np.uint8)
+    model = FakeHalfModel(scale=2)
+    up = Upscaler(model, tile=16, overlap=4, device="cuda", half=True)
+    assert up.half is True
+    out = up.process(frame)
+    assert out.shape == (64, 64, 3)
+
+
+@pytest.mark.gpu
+def test_half_requested_but_float32_model_does_not_crash_on_cuda(rng):
+    """Reproduces the reported bug directly: half=True + cuda device used to
+    be sufficient to set self.half=True regardless of what the model's
+    weights actually are. For an architecture like RealPLKSR where
+    supports_half is False, that forced a half input into float32 weights and
+    crashed with 'Input type (struct c10::Half) and bias type (float) should
+    be the same'. This is the scenario that must fail before the fix."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires a CUDA device")
+    frame = rng.integers(0, 256, (32, 32, 3), dtype=np.uint8)
+    model = FakeFloat32Model(scale=2)
+    up = Upscaler(model, tile=16, overlap=4, device="cuda", half=True)
+    assert up.half is False
+    out = up.process(frame)  # must not raise
+    assert out.shape == (64, 64, 3)

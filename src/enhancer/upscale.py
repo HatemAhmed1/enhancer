@@ -43,6 +43,24 @@ class Upscaler:
         self.model = model
         self.device = torch.device(device)
         self.half = half and self.device.type == "cuda"
+        if self.half:
+            # Derive the half decision from the model's ACTUAL parameter
+            # dtype, not from the caller's flag alone. load_model() only casts
+            # to half when spandrel reports descriptor.supports_half is True
+            # (e.g. PLKSR/RealPLKSR does not support it), so trusting `half`
+            # blindly here fed half-precision input into float32 weights and
+            # crashed with a dtype mismatch. When the model exposes no dtype
+            # (e.g. a bare test double), we cannot verify it, so we fall back
+            # to trusting the caller's flag.
+            model_dtype = getattr(model, "dtype", None)
+            if model_dtype is not None and model_dtype != torch.float16:
+                self.half = False
+                log.info(
+                    "half precision requested but %s weights are %s, not "
+                    "float16 (architecture does not support half); running "
+                    "this tier in fp32, which will be slower",
+                    getattr(model, "arch", type(model).__name__), model_dtype,
+                )
         self.runner = TileRunner(
             tile=tile, overlap=overlap, scale=model.scale, min_tile=128
         )

@@ -151,10 +151,22 @@ class LoadedModel:
         self.device = device
         self.scale = int(descriptor.scale)
         self.arch = descriptor.architecture.name
+        self.supports_half = bool(descriptor.supports_half)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         with torch.inference_mode():
             return self._d(x)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """The actual dtype of the model's parameters.
+
+        This is ground truth, independent of what a caller *asked* load_model()
+        for: when descriptor.supports_half is False, load_model() leaves the
+        weights in float32 even if half=True was requested (spec: only cast
+        when spandrel reports the architecture actually supports it).
+        """
+        return next(self._d.model.parameters()).dtype
 
 
 def load_model(path: Path, device: str | torch.device = "cuda", half: bool = True) -> LoadedModel:
