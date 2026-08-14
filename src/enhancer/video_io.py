@@ -116,6 +116,13 @@ class Decoder:
         cmd += ["-i", str(p.path)]
         if self.max_frames is not None:
             cmd += ["-frames:v", str(self.max_frames)]
+        # Explicit map plus passthrough fps mode: without this, ffmpeg's
+        # default frame-rate normalization can invent a trailing duplicate
+        # frame when the container's overall Duration (often set by an audio
+        # track with encoder priming/padding) runs slightly longer than the
+        # video content itself. That silently inflates the decoded frame
+        # count on any audio-bearing source.
+        cmd += ["-map", "0:v:0", "-fps_mode", "passthrough"]
         cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
         return cmd
 

@@ -1,3 +1,5 @@
+import subprocess
+
 import numpy as np
 import pytest
 
@@ -5,6 +7,15 @@ from enhancer.cli import render_resumable
 from enhancer.jobs import JobState
 from enhancer.segments import segment_path
 from enhancer.video_io import Decoder, SourceProfile
+
+
+def _stream_count(path, kind):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", kind,
+         "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    return len([line for line in out.stdout.splitlines() if line.strip()])
 
 
 class DoublingUpscaler:
@@ -95,3 +106,67 @@ def test_resume_skips_already_completed_segments(tmp_path, synthetic_clip):
         profile, ExplodesIfCalled(), tmp_path / "second.mkv",
         job_dir=job_dir, segment_frames=20, settings={"scale": 2},
     )
+
+
+def test_interrupted_render_with_audio_resumes_correctly(tmp_path, synthetic_clip_with_audio):
+    """End-to-end: a real interrupted render, with audio, resumes correctly.
+
+    Proves three things together: the crashed segment is discarded while the
+    prior segment survives, the resumed run does not reprocess completed
+    segments, and the final assembled file has correct frame count,
+    dimensions, and exactly one audio stream.
+    """
+    profile = SourceProfile.probe(synthetic_clip_with_audio)
+
+    class FailsPartwayThroughSecondSegment(DoublingUpscaler):
+        """50 frames / 20 per segment -> segments of 20, 20, 10.
+
+        Fails on the 6th frame of the second segment (raw frame index 25),
+        well after the first segment's 20 frames are done.
+        """
+
+        def __init__(self):
+            self.seen = 0
+
+        def process(self, frame):
+            self.seen += 1
+            if self.seen > 25:
+                raise RuntimeError("simulated crash mid-segment")
+            return super().process(frame)
+
+    job_dir = tmp_path / "job"
+    out = tmp_path / "out.mkv"
+    with pytest.raises(RuntimeError, match="simulated crash mid-segment"):
+        render_resumable(
+            profile, FailsPartwayThroughSecondSegment(), out,
+            job_dir=job_dir, segment_frames=20, settings={"scale": 2},
+        )
+    assert segment_path(job_dir, 0).exists(), "first segment should have survived"
+    assert not segment_path(job_dir, 1).exists(), "crashed segment must not persist"
+
+    class CountingUpscaler(DoublingUpscaler):
+        """Tracks how many frames it was actually asked to process."""
+
+        def __init__(self):
+            self.calls = 0
+
+        def process(self, frame):
+            self.calls += 1
+            return super().process(frame)
+
+    resumer = CountingUpscaler()
+    render_resumable(
+        profile, resumer, out,
+        job_dir=job_dir, segment_frames=20, settings={"scale": 2},
+    )
+
+    assert resumer.calls == 30, (
+        "only the remaining 30 frames (segments 1 and 2) should be "
+        f"reprocessed; got {resumer.calls} calls, which means the completed "
+        "segment 0 was reprocessed"
+    )
+
+    result = SourceProfile.probe(out)
+    assert result.width == 640 and result.height == 480
+    assert len(list(Decoder(result).frames())) == 50
+    assert _stream_count(out, "a") == 1, "final output must have exactly one audio stream"
