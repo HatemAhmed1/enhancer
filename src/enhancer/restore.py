@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 from .analyze import ScanType
+from .upscale import to_frame, to_tensor
 
 # Maximum hqdn3d strengths at degrain=1.0. Temporal is allowed to go
 # considerably higher than spatial: temporal denoising removes frame-to-frame
@@ -165,3 +167,45 @@ def apply_regrain(
     weight = 1.0 - (2.0 * luminance - 1.0).abs()
 
     return (x + noise * weight * (MAX_GRAIN_SIGMA * amount)).clamp_(0.0, 1.0)
+
+
+class TexturePost:
+    """Post-upscale texture work: detail retention then re-graining.
+
+    Ordering matters. Detail retention restores real high frequencies from the
+    source; re-graining then adds synthetic texture on top. Reversing them would
+    high-pass the synthetic grain into the retention step and double-count it.
+    """
+
+    def __init__(
+        self,
+        detail_retention: float = 0.25,
+        regrain: float = 0.6,
+        device: str = "cuda",
+        seed: int = 0,
+    ) -> None:
+        _check("detail_retention", detail_retention)
+        _check("regrain", regrain)
+        self.detail_retention = detail_retention
+        self.regrain = regrain
+        self.device = torch.device(device)
+        self.seed = seed
+
+    @property
+    def enabled(self) -> bool:
+        return self.detail_retention > 0 or self.regrain > 0
+
+    def apply(self, output: np.ndarray, source: np.ndarray, index: int = 0) -> np.ndarray:
+        """Apply texture work to one upscaled frame."""
+        if not self.enabled:
+            return output
+
+        out_t = to_tensor(output).to(self.device)
+        if self.detail_retention > 0:
+            src_t = to_tensor(source).to(self.device)
+            out_t = apply_detail_retention(out_t, src_t, self.detail_retention)
+        if self.regrain > 0:
+            # Seed varies per frame so grain moves like film rather than sitting
+            # static like dirt on the lens.
+            out_t = apply_regrain(out_t, self.regrain, seed=self.seed + index)
+        return to_frame(out_t)

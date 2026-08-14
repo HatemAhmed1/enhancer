@@ -211,3 +211,59 @@ def test_grain_is_suppressed_in_highlights_and_shadows():
 def test_regrain_rejects_amount_out_of_range():
     with pytest.raises(ValueError):
         apply_regrain(torch.rand(1, 3, 8, 8), amount=-0.1, seed=0)
+
+
+from enhancer.restore import TexturePost
+
+
+class _Passthrough:
+    scale = 2
+
+    def process(self, frame):
+        return np.repeat(np.repeat(frame, 2, axis=0), 2, axis=1)
+
+
+def test_texture_post_preserves_shape_and_dtype():
+    rng = np.random.default_rng(0)
+    source = rng.integers(0, 256, (32, 32, 3), dtype=np.uint8)
+    output = np.repeat(np.repeat(source, 2, axis=0), 2, axis=1)
+    post = TexturePost(detail_retention=0.3, regrain=0.5, device="cpu")
+    result = post.apply(output, source)
+    assert result.shape == output.shape
+    assert result.dtype == np.uint8
+
+
+def test_texture_post_disabled_returns_input_unchanged():
+    rng = np.random.default_rng(0)
+    source = rng.integers(0, 256, (16, 16, 3), dtype=np.uint8)
+    output = np.repeat(np.repeat(source, 2, axis=0), 2, axis=1)
+    post = TexturePost(detail_retention=0.0, regrain=0.0, device="cpu")
+    assert np.array_equal(post.apply(output, source), output)
+
+
+def test_texture_post_changes_the_frame_when_enabled():
+    rng = np.random.default_rng(0)
+    source = rng.integers(0, 256, (16, 16, 3), dtype=np.uint8)
+    output = np.repeat(np.repeat(source, 2, axis=0), 2, axis=1)
+    post = TexturePost(detail_retention=0.5, regrain=0.5, device="cpu")
+    assert not np.array_equal(post.apply(output, source), output)
+
+
+def test_texture_post_is_deterministic_per_frame_index():
+    """Grain must not flicker: the same frame index yields the same grain."""
+    rng = np.random.default_rng(0)
+    source = rng.integers(0, 256, (16, 16, 3), dtype=np.uint8)
+    output = np.repeat(np.repeat(source, 2, axis=0), 2, axis=1)
+    post = TexturePost(detail_retention=0.0, regrain=0.6, device="cpu")
+    assert np.array_equal(post.apply(output, source, index=7),
+                          post.apply(output, source, index=7))
+
+
+def test_grain_differs_between_frames():
+    """Static grain across frames reads as a dirty lens, not as film."""
+    rng = np.random.default_rng(0)
+    source = rng.integers(0, 256, (16, 16, 3), dtype=np.uint8)
+    output = np.repeat(np.repeat(source, 2, axis=0), 2, axis=1)
+    post = TexturePost(detail_retention=0.0, regrain=0.6, device="cpu")
+    assert not np.array_equal(post.apply(output, source, index=1),
+                              post.apply(output, source, index=2))
