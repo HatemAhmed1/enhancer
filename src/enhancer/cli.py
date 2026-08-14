@@ -46,11 +46,22 @@ def render_resumable(
     segment_frames: int = DEFAULT_SEGMENT_FRAMES,
     settings: dict | None = None,
     on_progress=None,
+    video_filter: str = "",
+    texture=None,
 ) -> Path:
     """Render `profile` to `output`, resuming any interrupted prior attempt.
 
     Output is written as independently complete segments so an interruption
     costs at most one segment. The final file is a stream-copy concat.
+
+    `video_filter` is applied inside the decoder, before upscaling. If it
+    contains a decimating filter (inverse telecine's `decimate`), the true
+    output frame count is unknowable from `profile.frame_count` alone and
+    segment boundaries would not line up with what ffmpeg actually decoded,
+    since `-ss` seeks in *input* time while decimation happens after that
+    seek. Rather than risk a misaligned resume, the whole source is rendered
+    as a single segment in that case, which simply forfeits resumability for
+    this job.
     """
     job_dir = Path(job_dir)
     settings = settings or {}
@@ -65,6 +76,9 @@ def render_resumable(
             f"be corrupt, or the container may not report duration. Try "
             f"remuxing it first: ffmpeg -i input -c copy remuxed.mkv"
         )
+
+    if "decimate" in video_filter:
+        segment_frames = profile.frame_count
 
     if (job_dir / "job.json").exists():
         job = JobState.load(job_dir, settings=settings)
@@ -83,11 +97,16 @@ def render_resumable(
 
         start = job.start_frame_for(index)
         count = job.frames_in_segment(index)
-        decoder = Decoder(profile, start_frame=start, max_frames=count)
+        decoder = Decoder(
+            profile, start_frame=start, max_frames=count, video_filter=video_filter,
+        )
 
         def processed(decoder=decoder, start=start):
             for i, frame in enumerate(decoder.frames()):
-                yield upscaler.process(frame)
+                upscaled = upscaler.process(frame)
+                if texture is not None and texture.enabled:
+                    upscaled = texture.apply(upscaled, frame, index=start + i)
+                yield upscaled
                 if on_progress:
                     on_progress(start + i + 1, job.total_frames)
 
@@ -101,6 +120,9 @@ def render_resumable(
 
 
 def cmd_video(args: argparse.Namespace) -> int:
+    from .analyze import ScanType, classify_scan, probe_scan
+    from .restore import RestoreSettings, TexturePost, build_filter_chain
+
     device = select_device(prefer_cuda=not args.cpu)
     model = load_model(Path(args.model), device=device, half=not args.cpu)
     tile = args.tile or _auto_tile(model.scale, args.overlap)
@@ -108,18 +130,56 @@ def cmd_video(args: argparse.Namespace) -> int:
     profile = SourceProfile.probe(args.input)
     up = Upscaler(model, tile=tile, overlap=args.overlap, device=device, half=not args.cpu)
 
+    if args.no_restore:
+        restore_settings = RestoreSettings(
+            deblock=0.0, degrain=0.0, detail_retention=0.0, regrain=0.0,
+        )
+        scan = ScanType.PROGRESSIVE
+        field_order = "tff"
+        video_filter = ""
+    else:
+        analysis = probe_scan(args.input)
+        scan = classify_scan(analysis)
+        field_order = analysis.field_order
+        restore_settings = RestoreSettings(
+            deblock=args.deblock, degrain=args.degrain,
+            detail_retention=args.detail_retention, regrain=args.regrain,
+        )
+        video_filter = build_filter_chain(scan, field_order, restore_settings)
+
+    texture = TexturePost(
+        detail_retention=restore_settings.detail_retention,
+        regrain=restore_settings.regrain,
+        device=str(device),
+    )
+
+    # Every restoration setting that can change the pixels goes into the job
+    # hash, including the derived filter string itself: changing any of these
+    # between runs against the same job directory must refuse to resume
+    # rather than splice together footage processed two different ways.
     settings = {
         "model": Path(args.model).name,
         "scale": model.scale,
         "tile": tile,
         "overlap": args.overlap,
         "cpu": bool(args.cpu),
+        "no_restore": bool(args.no_restore),
+        "deblock": restore_settings.deblock,
+        "degrain": restore_settings.degrain,
+        "detail_retention": restore_settings.detail_retention,
+        "regrain": restore_settings.regrain,
+        "scan": scan.value,
+        "field_order": field_order,
+        "video_filter": video_filter,
     }
     job_dir = Path(args.job_dir) if args.job_dir else Path(args.output).with_suffix(".job")
 
     print(f"{profile.width}x{profile.height} -> {profile.width * model.scale}x"
           f"{profile.height * model.scale}, {profile.frame_count} frames, tile={tile}")
     print(f"Job directory: {job_dir}  (interrupted renders resume from here)")
+    if "decimate" in video_filter:
+        print("Inverse telecine detected: this source will render as a single "
+              "segment, with resume disabled for this job.")
 
     def progress(done: int, total: int) -> None:
         if done % 50 == 0:
@@ -129,7 +189,7 @@ def cmd_video(args: argparse.Namespace) -> int:
         render_resumable(
             profile, up, args.output, job_dir=job_dir,
             segment_frames=args.segment_frames, settings=settings,
-            on_progress=progress,
+            on_progress=progress, video_filter=video_filter, texture=texture,
         )
     except SettingsMismatch as exc:
         print(f"\nCannot resume: {exc}")
@@ -139,6 +199,35 @@ def cmd_video(args: argparse.Namespace) -> int:
         return 3
 
     print(f"\nDone. CPU fallbacks: {up.cpu_fallback_count}")
+    return 0
+
+
+def cmd_analyze(args: argparse.Namespace) -> int:
+    from .analyze import ScanType, classify_scan, estimate_blockiness, estimate_grain, probe_scan
+
+    profile = SourceProfile.probe(args.input)
+    analysis = probe_scan(args.input)
+    scan = classify_scan(analysis)
+
+    frame = next(iter(Decoder(profile, max_frames=1).frames()))
+    grain = estimate_grain(frame)
+    blockiness = estimate_blockiness(frame)
+
+    print(f"Source:      {profile.width}x{profile.height} @ {profile.fps:.3f} fps")
+    print(f"Colour:      {profile.color_space or 'unspecified'} / SAR {profile.sar}")
+    print(f"Scan:        {scan.value} (field order {analysis.field_order})")
+    print(f"Grain:       {grain:.2f}")
+    print(f"Blockiness:  {blockiness:.2f}")
+    print()
+    if scan is ScanType.TELECINED:
+        print("Recommended: inverse telecine. This is film carried as 30i;")
+        print("             deinterlacing it would discard real detail.")
+    elif scan is ScanType.INTERLACED:
+        print("Recommended: deinterlace before upscaling.")
+    else:
+        print("Recommended: no scan correction needed.")
+    if blockiness > 2.0:
+        print("             Compression artifacts present; enable --deblock.")
     return 0
 
 
@@ -217,7 +306,21 @@ def main(argv: list[str] | None = None) -> int:
                     help="where to keep resumable state (default: <output>.job)")
     v.add_argument("--segment-frames", type=int, default=DEFAULT_SEGMENT_FRAMES,
                     help="frames per resumable segment")
+    v.add_argument("--deblock", type=float, default=0.0,
+                    help="deblocking strength, 0.0-1.0")
+    v.add_argument("--degrain", type=float, default=0.25,
+                    help="pre-upscale denoise strength, 0.0-1.0")
+    v.add_argument("--detail-retention", type=float, default=0.25,
+                    help="blend of real source high-frequency detail into the output, 0.0-1.0")
+    v.add_argument("--regrain", type=float, default=0.6,
+                    help="synthetic film grain added after upscaling, 0.0-1.0")
+    v.add_argument("--no-restore", action="store_true",
+                    help="skip all restoration and texture work")
     v.set_defaults(func=cmd_video)
+
+    a = sub.add_parser("analyze", help="inspect a source's scan type, grain, and compression")
+    a.add_argument("input")
+    a.set_defaults(func=cmd_analyze)
 
     m = sub.add_parser("models", help="list drop-in weights")
     m.add_argument("--dir", default="models/custom")

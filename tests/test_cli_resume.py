@@ -172,6 +172,36 @@ def test_interrupted_render_with_audio_resumes_correctly(tmp_path, synthetic_cli
     assert _stream_count(out, "a") == 1, "final output must have exactly one audio stream"
 
 
+def test_decimating_filter_forces_a_single_segment(tmp_path, synthetic_clip):
+    """Decimation changes the output frame count after -ss has already seeked
+    in input time, so segment boundaries computed from profile.frame_count
+    would not line up with what ffmpeg actually decoded. Rendering as one
+    segment sidesteps the misalignment entirely, at the cost of resumability
+    for this job."""
+    profile = SourceProfile.probe(synthetic_clip)
+    job_dir = tmp_path / "job"
+    render_resumable(
+        profile, DoublingUpscaler(), tmp_path / "out.mkv",
+        job_dir=job_dir, segment_frames=10, settings={"scale": 2},
+        video_filter="decimate",
+    )
+    assert segment_path(job_dir, 0).exists()
+    for i in range(1, 5):
+        assert not segment_path(job_dir, i).exists()
+
+
+def test_non_decimating_filter_still_segments_normally(tmp_path, synthetic_clip):
+    profile = SourceProfile.probe(synthetic_clip)
+    job_dir = tmp_path / "job"
+    render_resumable(
+        profile, DoublingUpscaler(), tmp_path / "out.mkv",
+        job_dir=job_dir, segment_frames=20, settings={"scale": 2},
+        video_filter="hqdn3d=4:3:6:4",
+    )
+    # 50 frames at 20 per segment -> 3 segments
+    assert segment_path(job_dir, 2).exists()
+
+
 def test_zero_frame_count_raises_a_clear_error(tmp_path, synthetic_clip):
     """Some containers report neither frame count nor duration.
 
