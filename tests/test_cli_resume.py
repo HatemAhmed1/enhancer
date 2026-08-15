@@ -382,3 +382,119 @@ def test_grain_is_applied_once_per_output_frame_when_interpolating(tmp_path, syn
     # starts at j+1, so boundary frames are upscaled twice. 50 sources across
     # 5 segments gives 4 overlaps.
     assert len(spy.detail_calls) == 54
+
+
+# --- dual pass --------------------------------------------------------------
+
+
+def test_dual_pass_produces_both_files(tmp_path, synthetic_clip):
+    from enhancer.cli import render_dual_pass
+
+    profile = SourceProfile.probe(synthetic_clip)
+    mid, final = render_dual_pass(
+        profile, DoublingUpscaler(), DoublingUpscaler(),
+        output=tmp_path / "out.mkv", job_dir=tmp_path / "job",
+        segment_frames=20, settings={"scale": 2},
+    )
+    assert mid.exists() and final.exists()
+
+
+def test_dual_pass_applies_both_scale_factors(tmp_path, synthetic_clip):
+    """Two 2x passes on 320x240 give 1280x960."""
+    from enhancer.cli import render_dual_pass
+
+    profile = SourceProfile.probe(synthetic_clip)
+    mid, final = render_dual_pass(
+        profile, DoublingUpscaler(), DoublingUpscaler(),
+        output=tmp_path / "out.mkv", job_dir=tmp_path / "job",
+        segment_frames=20, settings={"scale": 2},
+    )
+    assert (SourceProfile.probe(mid).width, SourceProfile.probe(mid).height) == (640, 480)
+    assert (SourceProfile.probe(final).width, SourceProfile.probe(final).height) == (1280, 960)
+
+
+def test_dual_pass_preserves_the_frame_count(tmp_path, synthetic_clip):
+    from enhancer.cli import render_dual_pass
+
+    profile = SourceProfile.probe(synthetic_clip)
+    _mid, final = render_dual_pass(
+        profile, DoublingUpscaler(), DoublingUpscaler(),
+        output=tmp_path / "out.mkv", job_dir=tmp_path / "job",
+        segment_frames=20, settings={"scale": 2},
+    )
+    assert len(list(Decoder(SourceProfile.probe(final)).frames())) == 50
+
+
+def test_dual_pass_keeps_the_intermediate_for_inspection(tmp_path, synthetic_clip):
+    """The whole point of stopping mid-way is having something to look at."""
+    from enhancer.cli import render_dual_pass
+
+    profile = SourceProfile.probe(synthetic_clip)
+    mid, _final = render_dual_pass(
+        profile, DoublingUpscaler(), DoublingUpscaler(),
+        output=tmp_path / "out.mkv", job_dir=tmp_path / "job",
+        segment_frames=20, settings={"scale": 2},
+    )
+    assert mid.exists()
+    assert "pass1" in mid.name
+
+
+def test_dual_pass_can_discard_the_intermediate(tmp_path, synthetic_clip):
+    from enhancer.cli import render_dual_pass
+
+    profile = SourceProfile.probe(synthetic_clip)
+    mid, _final = render_dual_pass(
+        profile, DoublingUpscaler(), DoublingUpscaler(),
+        output=tmp_path / "out.mkv", job_dir=tmp_path / "job",
+        segment_frames=20, settings={"scale": 2}, keep_intermediate=False,
+    )
+    assert not mid.exists()
+
+
+def test_dual_pass_uses_separate_job_dirs_per_pass(tmp_path, synthetic_clip):
+    """An interruption in pass two must not re-run pass one."""
+    from enhancer.cli import render_dual_pass
+
+    profile = SourceProfile.probe(synthetic_clip)
+    job_dir = tmp_path / "job"
+    render_dual_pass(
+        profile, DoublingUpscaler(), DoublingUpscaler(),
+        output=tmp_path / "out.mkv", job_dir=job_dir,
+        segment_frames=20, settings={"scale": 2},
+    )
+    assert (job_dir / "pass1" / "job.json").exists()
+    assert (job_dir / "pass2" / "job.json").exists()
+
+
+def test_dual_pass_progress_spans_both_passes(tmp_path, synthetic_clip):
+    from enhancer.cli import render_dual_pass
+
+    profile = SourceProfile.probe(synthetic_clip)
+    seen = []
+    render_dual_pass(
+        profile, DoublingUpscaler(), DoublingUpscaler(),
+        output=tmp_path / "out.mkv", job_dir=tmp_path / "job",
+        segment_frames=20, settings={"scale": 2},
+        on_progress=lambda d, t: seen.append((d, t)),
+    )
+    assert seen[-1][0] == seen[-1][1], "progress must reach 100% across both passes"
+    assert seen[-1][1] == 100, "50 frames over two passes"
+
+
+def test_dual_pass_can_use_different_models_per_pass(tmp_path, synthetic_clip):
+    """Commonly a texture-preserving model first, a fast one second."""
+    from enhancer.cli import render_dual_pass
+
+    class _Tripler(DoublingUpscaler):
+        scale = 3
+
+        def process(self, frame):
+            return np.repeat(np.repeat(frame, 3, axis=0), 3, axis=1)
+
+    profile = SourceProfile.probe(synthetic_clip)
+    _mid, final = render_dual_pass(
+        profile, DoublingUpscaler(), _Tripler(),
+        output=tmp_path / "out.mkv", job_dir=tmp_path / "job",
+        segment_frames=20, settings={"scale": 2},
+    )
+    assert SourceProfile.probe(final).width == 320 * 2 * 3

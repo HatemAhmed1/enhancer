@@ -202,6 +202,72 @@ def render_resumable(
     return assemble(job_dir, job.segment_count, output, profile)
 
 
+def render_dual_pass(
+    profile: SourceProfile,
+    first_upscaler,
+    second_upscaler,
+    output: str | Path,
+    job_dir: str | Path,
+    intermediate: str | Path | None = None,
+    keep_intermediate: bool = True,
+    on_progress=None,
+    **kwargs,
+) -> tuple[Path, Path]:
+    """Upscale in two stages with an inspectable file between them.
+
+    Returns `(intermediate, final)`.
+
+    Each pass is an ordinary resumable render with its own job directory, so an
+    interruption during the second pass never re-runs the first. The point of
+    stopping in the middle is that the intermediate is a real file you can look
+    at before committing GPU-hours to the second stage, and that the two passes
+    can use different models — commonly a texture-preserving model for the first
+    doubling and a fast one for the second, where there is less recoverable
+    detail left to find.
+
+    Restoration and interpolation belong to the first pass only. Degraining an
+    already-degrained frame flattens it further, and interpolating twice would
+    compound synthesis errors, so `kwargs` are not forwarded to the second pass.
+    """
+    job_dir = Path(job_dir)
+    output = Path(output)
+    intermediate = Path(intermediate) if intermediate else output.with_name(
+        output.stem + "_pass1" + output.suffix
+    )
+
+    total_passes = 2
+
+    def pass_progress(index: int):
+        if on_progress is None:
+            return None
+
+        def report(done: int, total: int) -> None:
+            # Report a single continuous scale across both passes.
+            on_progress(index * total + done, total * total_passes)
+
+        return report
+
+    render_resumable(
+        profile, first_upscaler, intermediate,
+        job_dir=job_dir / "pass1",
+        on_progress=pass_progress(0),
+        **kwargs,
+    )
+
+    mid_profile = SourceProfile.probe(intermediate)
+    render_resumable(
+        mid_profile, second_upscaler, output,
+        job_dir=job_dir / "pass2",
+        settings=kwargs.get("settings"),
+        segment_frames=kwargs.get("segment_frames", DEFAULT_SEGMENT_FRAMES),
+        on_progress=pass_progress(1),
+    )
+
+    if not keep_intermediate:
+        intermediate.unlink(missing_ok=True)
+    return intermediate, output
+
+
 def rife_weights() -> list[Path]:
     """Available RIFE weight files, newest-sorted."""
     from .rife import RIFE_DIR
@@ -375,13 +441,34 @@ def cmd_video(args: argparse.Namespace) -> int:
     )
 
     try:
-        render_resumable(
-            profile, up, args.output, job_dir=job_dir,
-            segment_frames=args.segment_frames, settings=settings,
-            on_progress=progress, video_filter=video_filter, texture=texture,
-            interpolate_to=target_fps, flow_model=flow_model,
-            scene_threshold=scene_threshold,
-        )
+        if args.dual_pass:
+            second_path = Path(args.pass2_model) if args.pass2_model else Path(args.model)
+            second_model = load_model(second_path, device=device, half=not args.cpu)
+            second = Upscaler(
+                second_model, tile=args.tile or _auto_tile(second_model.scale, args.overlap),
+                overlap=args.overlap, device=device, half=not args.cpu,
+            )
+            print(f"Dual pass: {model.scale}x then {second_model.scale}x "
+                  f"({second_path.name})")
+            mid, _final = render_dual_pass(
+                profile, up, second, args.output, job_dir=job_dir,
+                keep_intermediate=not args.discard_intermediate,
+                on_progress=progress,
+                segment_frames=args.segment_frames, settings=settings,
+                video_filter=video_filter, texture=texture,
+                interpolate_to=target_fps, flow_model=flow_model,
+                scene_threshold=scene_threshold,
+            )
+            if not args.discard_intermediate:
+                print(f"\nIntermediate kept at {mid}")
+        else:
+            render_resumable(
+                profile, up, args.output, job_dir=job_dir,
+                segment_frames=args.segment_frames, settings=settings,
+                on_progress=progress, video_filter=video_filter, texture=texture,
+                interpolate_to=target_fps, flow_model=flow_model,
+                scene_threshold=scene_threshold,
+            )
     except SettingsMismatch as exc:
         print(f"\nCannot resume: {exc}")
         return 2
@@ -559,6 +646,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="frame rate multiplier, e.g. 2 (alternative to --fps)")
     v.add_argument("--scene-threshold", type=float, default=None,
                     help="cut sensitivity 0-1; lower detects more cuts")
+    v.add_argument("--dual-pass", action="store_true",
+                    help="upscale in two stages, keeping an inspectable file between them")
+    v.add_argument("--pass2-model", default=None, metavar="PATH",
+                    help="model for the second pass (default: the same one)")
+    v.add_argument("--discard-intermediate", action="store_true",
+                    help="delete the intermediate once the second pass finishes")
     v.add_argument("--no-restore", action="store_true",
                     help="skip all restoration and texture work")
     v.set_defaults(func=cmd_video)

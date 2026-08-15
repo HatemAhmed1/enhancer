@@ -4,7 +4,7 @@ Local GPU video and image upscaler, tuned for restoring Indian cinema footage �
 
 Runs entirely offline. No cloud services, no API keys, no telemetry.
 
-**Status:** working end to end — engine, restoration, frame interpolation, resumable rendering, and a desktop window. 315 tests. See [Roadmap](#roadmap) for what remains.
+**Status:** working end to end — engine, restoration, frame interpolation, resumable rendering, and a desktop window. 323 tests. See [Roadmap](#roadmap) for what remains.
 
 ---
 
@@ -159,6 +159,16 @@ Restoration is on by default. Scan correction is chosen automatically from the d
 
 Restoration costs roughly 35% throughput. Use `--no-restore` for a fast preview, then render properly.
 
+**Two-stage upscaling**
+
+```powershell
+.venv\Scripts\python.exe -m enhancer.cli video models\custom\2xParimgCompact.pth input.mp4 output.mkv --dual-pass
+```
+
+Upscales in two stages and keeps the halfway file so you can look at it before the second stage runs. `--pass2-model` lets each stage use a different model — commonly a texture-preserving one for the first doubling and a fast one for the second, where there is less recoverable detail left to find. Each stage has its own job directory, so an interruption in the second never re-runs the first.
+
+Restoration and interpolation apply to the first pass only: degraining an already-degrained frame flattens it further, and interpolating twice compounds synthesis errors.
+
 **Increase the frame rate**
 
 ```powershell
@@ -265,7 +275,7 @@ Run the test suite:
 | Restoration | Deinterlace/IVTC, deblock, degrain, re-grain, detail retention | Complete |
 | Interpolation | RIFE frame interpolation, scene-change detection, target FPS | Complete |
 | Interface | Desktop GUI, segment preview | Complete |
-| Comparison | Dual-pass 2K→4K, A/B compare view | Planned |
+| Comparison | A/B compare view, batch queue | Planned |
 
 ---
 
