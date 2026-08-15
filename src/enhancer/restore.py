@@ -195,17 +195,46 @@ class TexturePost:
     def enabled(self) -> bool:
         return self.detail_retention > 0 or self.regrain > 0
 
+    @property
+    def detail_enabled(self) -> bool:
+        return self.detail_retention > 0
+
+    @property
+    def grain_enabled(self) -> bool:
+        return self.regrain > 0
+
+    def apply_detail(self, output: np.ndarray, source: np.ndarray) -> np.ndarray:
+        """Restore the source's real high frequencies over one upscaled frame.
+
+        Must run before any frame interpolation, since it needs each upscaled
+        frame paired with the source frame it came from. Synthesized frames have
+        no source counterpart.
+        """
+        if not self.detail_enabled:
+            return output
+        out_t = to_tensor(output).to(self.device)
+        src_t = to_tensor(source).to(self.device)
+        return to_frame(apply_detail_retention(out_t, src_t, self.detail_retention))
+
+    def apply_grain(self, frame: np.ndarray, index: int = 0) -> np.ndarray:
+        """Add grain to one OUTPUT frame.
+
+        Must run after any frame interpolation. Graining first and interpolating
+        second blends two independent noise fields, which attenuates grain on
+        synthesized frames by 1/sqrt(2). At 24 to 60 fps four output frames in
+        five are synthesized, so that produces grain pulsing at the source frame
+        rate — and grain is the whole anti-waxy mechanism.
+
+        The seed varies per frame so grain moves like film rather than sitting
+        static like dirt on the lens.
+        """
+        if not self.grain_enabled:
+            return frame
+        out_t = to_tensor(frame).to(self.device)
+        return to_frame(apply_regrain(out_t, self.regrain, seed=self.seed + index))
+
     def apply(self, output: np.ndarray, source: np.ndarray, index: int = 0) -> np.ndarray:
-        """Apply texture work to one upscaled frame."""
+        """Both stages, for the non-interpolating path where order is moot."""
         if not self.enabled:
             return output
-
-        out_t = to_tensor(output).to(self.device)
-        if self.detail_retention > 0:
-            src_t = to_tensor(source).to(self.device)
-            out_t = apply_detail_retention(out_t, src_t, self.detail_retention)
-        if self.regrain > 0:
-            # Seed varies per frame so grain moves like film rather than sitting
-            # static like dirt on the lens.
-            out_t = apply_regrain(out_t, self.regrain, seed=self.seed + index)
-        return to_frame(out_t)
+        return self.apply_grain(self.apply_detail(output, source), index)

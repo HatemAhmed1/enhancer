@@ -873,7 +873,14 @@ git add -A && git commit -m "feat(cli): frame interpolation and target frame rat
 | §4.3 mandatory scene-change detection | Tasks 2, 3 |
 | §4.3 upscale-before-interpolate ordering | Task 5 |
 
+**Resolved by the post-implementation audit:**
+- *Grain ordering.* Re-graining originally ran before interpolation, so the flow model blended two independent noise fields and attenuated grain on synthesized frames by 1/sqrt(2) — measured at 0.705. At 24 to 60 fps, 80% of output frames are synthesized, so grain pulsed at the source rate. Re-grain now runs after interpolation on the output index; detail retention stays before it, since it needs each upscaled frame paired with its own source frame. Verified on a real render at 0.997.
+- *Inverse telecine plus interpolation.* The plan was built from the probed frame count while decimation made the decoder supply roughly four fifths of it, so the plan indexed past the end of the source. Now rejected with a message pointing at the two-pass workflow.
+- *Segment memory.* Segment size is now capped by output resolution against a 1 GB budget. The 500-frame default held ~4.6 GB at 1080p to 4K.
+- *Weight discovery.* `RIFE_DIR` was relative and silently found nothing when run from another working directory. Now anchored to the project root, with a local `models/rife` still taking precedence.
+
 **Known gaps to address later:**
-- `interpolate_stream` materializes a segment's frames in memory. At 500-frame segments and 4K output that is significant; segment size may need lowering when interpolating, or the driver reworked to a sliding window.
+- Segment boundaries upscale one source frame twice: the last output frame of a segment brackets source j to j+1, and the next segment starts at j+1. Redundant but not incorrect, and negligible at realistic segment sizes.
+- Interpolation throughput has not been measured on real footage.
 - The configurable stage order in §4.3 (interpolate-before-upscale for speed on the Turbo tier) is not implemented; only the quality-first order is.
 - Scene detection uses a global histogram. A cut between two similarly-lit shots of the same scene may be missed. A per-tile histogram would be more sensitive at some cost.

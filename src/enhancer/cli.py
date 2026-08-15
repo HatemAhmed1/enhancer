@@ -21,6 +21,10 @@ DEFAULT_BYTES_PER_OUTPUT_PIXEL = 64
 DEFAULT_SEGMENT_FRAMES = 500
 DEFAULT_SCENE_THRESHOLD = 0.30
 
+# Interpolation holds a segment's upscaled frames in memory at once. This caps
+# that working set so segment size adapts to output resolution.
+INTERPOLATION_RAM_BUDGET = 1024 ** 3
+
 
 def _auto_tile(scale: int, overlap: int) -> int:
     free = free_vram_bytes()
@@ -96,9 +100,30 @@ def render_resumable(
     if interpolate_to is not None:
         if flow_model is None:
             raise ValueError("interpolate_to was given without a flow_model")
+        if "decimate" in video_filter:
+            # The plan is built from the probed frame count, but decimation
+            # drops roughly one frame in five inside ffmpeg, so the decoder
+            # supplies fewer frames than the plan indexes. Knowing the true
+            # post-filter count would take a separate counting pass.
+            raise ValueError(
+                "frame interpolation cannot be combined with inverse telecine "
+                "in one pass, because decimation changes the frame count that "
+                "interpolation timing is derived from. Run inverse telecine "
+                "first, then interpolate the result:\n"
+                "  enhancer video MODEL in.mkv ivtc.mkv\n"
+                "  enhancer video MODEL ivtc.mkv out.mkv --fps 60 --no-restore"
+            )
         plan = plan_output_frames(profile.fps, interpolate_to, profile.frame_count)
         total_frames = len(plan)
         out_fps = interpolate_to
+
+        # Interpolation materialises a segment's upscaled frames in memory, so
+        # segment size has to be bounded by output resolution rather than left
+        # at the default. At 1080p to 4K the default 500 would hold ~4.6 GB.
+        per_frame = profile.width * scale * profile.height * scale * 3
+        affordable_src = max(24, INTERPOLATION_RAM_BUDGET // max(1, per_frame))
+        cap = max(30, int(affordable_src * interpolate_to / profile.fps))
+        segment_frames = min(segment_frames, cap)
 
     if (job_dir / "job.json").exists():
         job = JobState.load(job_dir, settings=settings)
@@ -132,26 +157,38 @@ def render_resumable(
             video_filter=video_filter,
         )
 
-        def upscaled_frames(decoder=decoder, src_start=src_start):
+        def upscaled_frames(decoder=decoder, src_start=src_start, grain=True):
+            """Upscale each source frame and restore its real detail.
+
+            Grain is applied here only when nothing downstream will blend these
+            frames together. When interpolating it is deferred to the output
+            stage, so every output frame gets full-strength grain.
+            """
             for i, frame in enumerate(decoder.frames()):
                 out = upscaler.process(frame)
                 if texture is not None and texture.enabled:
-                    out = texture.apply(out, frame, index=src_start + i)
+                    out = texture.apply_detail(out, frame)
+                    if grain:
+                        out = texture.apply_grain(out, index=src_start + i)
                 yield out
 
         def processed(
             decoder=decoder, start=start, src_start=src_start, segment_plan=segment_plan
         ):
             if segment_plan is None:
-                frames = upscaled_frames(decoder, src_start)
+                frames = upscaled_frames(decoder, src_start, grain=True)
             else:
-                # Upscale first, then interpolate: RIFE blends already-detailed
-                # frames, and the upscaler never runs on synthesized content.
+                # Upscale first, then interpolate: the flow model blends
+                # already-detailed frames, and the upscaler never runs on
+                # synthesized content.
                 frames = render_from_plan(
-                    upscaled_frames(decoder, src_start), src_start,
+                    upscaled_frames(decoder, src_start, grain=False), src_start,
                     segment_plan, flow_model, scene_threshold,
                 )
             for i, frame in enumerate(frames):
+                if segment_plan is not None and texture is not None and texture.grain_enabled:
+                    # Grain after interpolation, keyed on the OUTPUT index.
+                    frame = texture.apply_grain(frame, index=start + i)
                 yield frame
                 if on_progress:
                     on_progress(start + i + 1, job.total_frames)
@@ -165,15 +202,72 @@ def render_resumable(
     return assemble(job_dir, job.segment_count, output, profile)
 
 
+def rife_weights() -> list[Path]:
+    """Available RIFE weight files, newest-sorted."""
+    from .rife import RIFE_DIR
+
+    return sorted(RIFE_DIR.glob("*.pkl")) + sorted(RIFE_DIR.glob("*.pth"))
+
+
+def resolve_target_fps(
+    fps: float | None,
+    multiplier: float | None,
+    src_fps: float,
+    have_weights: bool,
+) -> tuple[float | None, str | None]:
+    """Work out the interpolation target, or explain why it is invalid.
+
+    Separated from `cmd_video` so bad flags are rejected before a model is
+    loaded, and so this logic is testable without a GPU or weights on disk.
+    Returns `(target_fps, error)`; exactly one is ever non-None.
+    """
+    if fps is not None and multiplier is not None:
+        return None, "Use either --fps or --interpolate, not both."
+
+    if fps is not None:
+        target = float(fps)
+    elif multiplier is not None:
+        from .interpolate import Interpolator
+
+        try:
+            target = Interpolator.target_fps(src_fps, float(multiplier))
+        except ValueError as exc:
+            return None, str(exc)
+    else:
+        return None, None
+
+    if target < src_fps:
+        return None, (
+            f"Target rate {target:g} is below the source rate {src_fps:.3f}; "
+            f"this tool interpolates but does not decimate."
+        )
+    if not have_weights:
+        from .rife import RIFE_DIR
+
+        return None, (
+            f"Frame interpolation needs RIFE weights in {RIFE_DIR}. "
+            f"See the setup guide."
+        )
+    return target, None
+
+
 def cmd_video(args: argparse.Namespace) -> int:
     from .analyze import ScanType, classify_scan, probe_scan
     from .restore import RestoreSettings, TexturePost, build_filter_chain
 
+    profile = SourceProfile.probe(args.input)
+
+    # Validate before loading a model: a typo should not cost a 60 MB load.
+    target_fps, error = resolve_target_fps(
+        args.fps, args.interpolate, profile.fps, bool(rife_weights())
+    )
+    if error:
+        print(error)
+        return 3
+
     device = select_device(prefer_cuda=not args.cpu)
     model = load_model(Path(args.model), device=device, half=not args.cpu)
     tile = args.tile or _auto_tile(model.scale, args.overlap)
-
-    profile = SourceProfile.probe(args.input)
     up = Upscaler(model, tile=tile, overlap=args.overlap, device=device, half=not args.cpu)
 
     if args.no_restore:
@@ -199,34 +293,13 @@ def cmd_video(args: argparse.Namespace) -> int:
         device=str(device),
     )
 
-    if args.fps is not None and args.interpolate is not None:
-        print("Use either --fps or --interpolate, not both.")
-        return 3
-
-    target_fps = None
     flow_model = None
-    if args.fps is not None:
-        target_fps = float(args.fps)
-    elif args.interpolate is not None:
-        from .interpolate import Interpolator
-
-        target_fps = Interpolator.target_fps(profile.fps, float(args.interpolate))
-
     if target_fps is not None:
-        if target_fps < profile.fps:
-            print(f"Target rate {target_fps} is below the source rate "
-                  f"{profile.fps:.3f}; this tool interpolates but does not decimate.")
-            return 3
         # Loaded only when interpolation is requested, so a missing RIFE weight
         # file never blocks a plain upscale.
-        from .rife import RIFE_DIR, load_rife
+        from .rife import load_rife
 
-        weights = sorted(RIFE_DIR.glob("*.pkl")) + sorted(RIFE_DIR.glob("*.pth"))
-        if not weights:
-            print(f"Frame interpolation needs RIFE weights in {RIFE_DIR}. "
-                  f"See the setup guide.")
-            return 4
-        flow_model = load_rife(weights[0], device=device)
+        flow_model = load_rife(rife_weights()[0], device=device)
 
     # Every restoration setting that can change the pixels goes into the job
     # hash, including the derived filter string itself: changing any of these

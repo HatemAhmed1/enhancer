@@ -17,7 +17,21 @@ import torch.nn.functional as F
 
 from .ifnet import IFNet
 
-RIFE_DIR = Path("models/rife")
+def _rife_dir() -> Path:
+    """Where RIFE weights live.
+
+    Anchored to the project root rather than the working directory, so
+    interpolation does not silently fail to find its weights when the tool is
+    run from somewhere else. A `models/rife` beside the caller still wins, which
+    keeps a per-project override possible.
+    """
+    local = Path("models/rife")
+    if local.is_dir():
+        return local
+    return Path(__file__).resolve().parents[3] / "models" / "rife"
+
+
+RIFE_DIR = _rife_dir()
 
 # block0 (the coarsest IFBlock) combines its scale_list entry (16) with two
 # internal stride-2 convs (4x), for a total downsample of 64x. Padding to a

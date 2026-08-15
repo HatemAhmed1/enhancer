@@ -300,3 +300,85 @@ def test_interpolation_without_a_flow_model_is_rejected(tmp_path, synthetic_clip
             job_dir=tmp_path / "job", segment_frames=20, settings={"scale": 2},
             interpolate_to=50.0,
         )
+
+
+def test_interpolation_with_inverse_telecine_is_rejected(tmp_path, synthetic_clip):
+    """Decimation changes the frame count interpolation timing is derived from.
+
+    The plan would be built from the probed count while the decoder supplies
+    roughly four fifths of it, so the plan indexes past the end of the source.
+    """
+    profile = SourceProfile.probe(synthetic_clip)
+    with pytest.raises(ValueError, match="inverse telecine"):
+        render_resumable(
+            profile, DoublingUpscaler(), tmp_path / "out.mkv",
+            job_dir=tmp_path / "job", segment_frames=20, settings={"scale": 2},
+            interpolate_to=50.0, flow_model=_CrossFade(),
+            video_filter="fieldmatch,decimate",
+        )
+
+
+def test_interpolation_caps_segment_size_for_memory(tmp_path, synthetic_clip):
+    """Segments must shrink with output resolution, not stay at the default.
+
+    A segment's upscaled frames are all resident at once during interpolation.
+    """
+    from enhancer.cli import INTERPOLATION_RAM_BUDGET
+
+    profile = SourceProfile.probe(synthetic_clip)
+    job_dir = tmp_path / "job"
+    render_resumable(
+        profile, DoublingUpscaler(), tmp_path / "out.mkv",
+        job_dir=job_dir, segment_frames=100000, settings={"scale": 2},
+        interpolate_to=50.0, flow_model=_CrossFade(),
+    )
+    import json
+    journal = json.loads((job_dir / "job.json").read_text())
+    per_frame = (profile.width * 2) * (profile.height * 2) * 3
+    held = (journal["segment_frames"] / 2.0) * per_frame
+    assert held <= INTERPOLATION_RAM_BUDGET * 1.1, "segment size must respect the RAM budget"
+
+
+class _GrainSpy:
+    """Records which frame indices grain was applied to."""
+
+    def __init__(self):
+        self.detail_calls = []
+        self.grain_calls = []
+        self.detail_retention = 0.25
+        self.regrain = 0.6
+
+    enabled = True
+    detail_enabled = True
+    grain_enabled = True
+
+    def apply_detail(self, output, source):
+        self.detail_calls.append(None)
+        return output
+
+    def apply_grain(self, frame, index=0):
+        self.grain_calls.append(index)
+        return frame
+
+
+def test_grain_is_applied_once_per_output_frame_when_interpolating(tmp_path, synthetic_clip):
+    """Graining before interpolation would blend two noise fields together.
+
+    That attenuates grain on synthesized frames by 1/sqrt(2); at 24 to 60 fps
+    four frames in five are synthesized, producing visible grain pulsing.
+    """
+    profile = SourceProfile.probe(synthetic_clip)
+    spy = _GrainSpy()
+    render_resumable(
+        profile, DoublingUpscaler(), tmp_path / "out.mkv",
+        job_dir=tmp_path / "job", segment_frames=20, settings={"scale": 2},
+        interpolate_to=50.0, flow_model=_CrossFade(), texture=spy,
+    )
+    assert len(spy.grain_calls) == 100, "one grain call per OUTPUT frame"
+    assert sorted(spy.grain_calls) == list(range(100)), "grain seeds must be output indices"
+
+    # Detail runs per SOURCE frame, plus one per segment boundary: the last
+    # output frame of a segment brackets source j to j+1, and the next segment
+    # starts at j+1, so boundary frames are upscaled twice. 50 sources across
+    # 5 segments gives 4 overlaps.
+    assert len(spy.detail_calls) == 54
