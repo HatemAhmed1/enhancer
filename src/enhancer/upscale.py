@@ -69,6 +69,16 @@ class Upscaler:
             # render slows when it bites, but never fails: tiles shrink and the
             # per-frame CPU fallback remains in place underneath.
             ceiling = max(1, int(vram_budget))
+            physical = total_vram_bytes()
+            if physical and ceiling > physical:
+                # Above the card's own memory, so the driver will spill into
+                # system RAM. That makes an oversized model runnable at all,
+                # at a large speed cost, and is never chosen automatically.
+                log.info(
+                    "Memory cap of %.1f GB exceeds the card's %.1f GB; the "
+                    "driver will use system memory. Expect this to be slow.",
+                    ceiling / 1024 ** 3, physical / 1024 ** 3,
+                )
         else:
             ceiling = physical_vram_ceiling(total_vram_bytes())
         self.runner = TileRunner(

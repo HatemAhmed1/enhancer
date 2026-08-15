@@ -370,3 +370,54 @@ def test_every_memory_option_is_explained(window):
 
     for i in range(window.vram_budget.count()):
         assert window.vram_budget.itemData(i, Qt.ToolTipRole)
+
+
+# --- theme and alignment ----------------------------------------------------
+
+
+def test_no_inline_styles_remain_in_the_window():
+    """Styling belongs in theme.py, or it drifts control by control."""
+    import pathlib
+
+    source = pathlib.Path("src/enhancer/window.py").read_text(encoding="utf-8")
+    assert "setStyleSheet" not in source
+
+
+def test_form_labels_are_all_the_same_width(window):
+    from enhancer.window import field_label
+
+    widths = {field_label(t).maximumWidth() for t in
+              ("Weights", "Degrain", "Cut sensitivity", "Graphics memory")}
+    assert len(widths) == 1, "field columns would not line up"
+
+
+def test_label_column_fits_the_longest_label(window):
+    from PySide6.QtGui import QFontMetrics
+    from PySide6.QtWidgets import QApplication
+
+    from enhancer.window import FIELD_LABELS, label_width
+
+    metrics = QFontMetrics(QApplication.font())
+    widest = max(metrics.horizontalAdvance(t) for t in FIELD_LABELS)
+    assert label_width() > widest, "labels would be clipped"
+
+
+def test_render_is_the_primary_action(window):
+    assert window.render_button.objectName() == "primary"
+    assert window.preview_button.objectName() != "primary"
+
+
+def test_queue_buttons_are_equal_width(window):
+    widths = {getattr(window, f"btn_queue_{k}").minimumWidth()
+              for k in ("start", "stop", "remove", "clear")}
+    assert len(widths) == 1
+
+
+def test_action_buttons_are_equal_width(window):
+    widths = {b.minimumWidth() for b in
+              (window.preview_button, window.render_button, window.cancel_button)}
+    assert len(widths) == 1
+
+
+def test_bring_to_front_does_not_raise(window):
+    window.bring_to_front()

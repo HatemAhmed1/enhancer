@@ -7,7 +7,7 @@ import traceback
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QFontMetrics
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import theme
 from .analyze import classify_scan, estimate_blockiness, estimate_grain, probe_scan
 from .gui import CancelledError, RenderJob
 from .help_text import GUIDE_SECTIONS, HELP, MODEL_NOTES, RECIPES, describe_model
@@ -47,6 +48,12 @@ from .video_io import Decoder, SourceProfile
 MEDIA_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".png", ".jpg", ".jpeg"}
 PREVIEW_SECONDS = 10
 
+# A cap deliberately set above any consumer card, so the graphics driver spills
+# into system memory instead of the tile planner shrinking to fit. That is the
+# only way to run a model whose weights alone exceed the card, and it is much
+# slower, so it is never automatic.
+SYSTEM_MEMORY_MB = 32768
+
 # Graphics-memory caps offered in the Output panel, in megabytes.
 VRAM_CHOICES = [
     ("Automatic", None),
@@ -54,6 +61,7 @@ VRAM_CHOICES = [
     ("3 GB", 3072),
     ("4 GB", 4096),
     ("5 GB — maximum speed", 5120),
+    ("Use system memory — for oversized models (slow)", SYSTEM_MEMORY_MB),
 ]
 
 
@@ -134,27 +142,66 @@ def help_button(key: str) -> QLabel:
     as paragraph breaks.
     """
     label = QLabel("?")
+    label.setObjectName("help")
     label.setToolTip(HELP.get(key, "No description available."))
     label.setAlignment(Qt.AlignCenter)
-    label.setFixedSize(18, 18)
+    label.setFixedSize(16, 16)
     label.setCursor(Qt.WhatsThisCursor)
-    label.setStyleSheet(
-        "QLabel { border: 1px solid palette(mid); border-radius: 9px;"
-        " color: palette(mid); font-size: 11px; font-weight: bold; }"
-        "QLabel:hover { color: palette(highlight); border-color: palette(highlight); }"
-    )
     return label
 
 
-def with_help(widget: QWidget, key: str) -> QWidget:
-    """Pair a control with its '?' button on one row."""
+def with_help(widget: QWidget, key: str, top: bool = False) -> QWidget:
+    """Pair a control with its '?' on one row.
+
+    Centred against single-line controls and pinned to the top against blocks
+    of text, so the marker sits on the first line either way.
+    """
     holder = QWidget()
     row = QHBoxLayout(holder)
     row.setContentsMargins(0, 0, 0, 0)
-    row.setSpacing(6)
+    row.setSpacing(theme.GAP_TIGHT)
     row.addWidget(widget, 1)
-    row.addWidget(help_button(key), 0, Qt.AlignTop)
+    row.addWidget(help_button(key), 0, Qt.AlignTop if top else Qt.AlignVCenter)
     return holder
+
+
+def form(parent: QWidget) -> QFormLayout:
+    """A form laid out the same way everywhere."""
+    layout = QFormLayout(parent)
+    layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+    layout.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+    layout.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+    layout.setHorizontalSpacing(theme.GAP)
+    layout.setVerticalSpacing(theme.GAP_TIGHT)
+    layout.setContentsMargins(0, 0, 0, 0)
+    return layout
+
+
+FIELD_LABELS = (
+    "Weights", "Degrain", "Detail retention", "Re-grain", "Deblock",
+    "Mode", "Target", "Multiplier", "Cut sensitivity",
+    "File", "Segment frames", "Graphics memory",
+)
+
+
+def label_width() -> int:
+    """Width of the widest form label, measured in the font actually in use.
+
+    Hardcoding this clipped labels under a different font or at a different
+    display scaling. Measuring costs nothing and cannot be wrong.
+    """
+    metrics = QFontMetrics(QApplication.font())
+    return max(metrics.horizontalAdvance(text) for text in FIELD_LABELS) + theme.GAP
+
+
+def field_label(text: str) -> QLabel:
+    """A form label of uniform width, so every field column lines up."""
+    label = QLabel(text)
+    width = label_width()
+    label.setMinimumWidth(width)
+    label.setMaximumWidth(width)
+    label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+    return label
 
 
 class MainWindow(QMainWindow):
@@ -178,14 +225,16 @@ class MainWindow(QMainWindow):
         # every group expands with the window rather than sitting at a fixed size.
         left = QWidget()
         left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 6, 0)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(theme.GAP)
         left_layout.addWidget(self._source_group(), 1)
         left_layout.addWidget(self._model_group())
         left_layout.addWidget(self._output_group())
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(6, 0, 0, 0)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(theme.GAP)
         right_layout.addWidget(self._texture_group())
         right_layout.addWidget(self._fps_group())
         right_layout.addWidget(self._queue_group(), 1)
@@ -199,6 +248,8 @@ class MainWindow(QMainWindow):
 
         root = QWidget()
         layout = QVBoxLayout(root)
+        layout.setContentsMargins(theme.GAP_WIDE, theme.GAP_WIDE, theme.GAP_WIDE, theme.GAP_WIDE)
+        layout.setSpacing(theme.GAP)
         layout.addWidget(self.columns, 1)
         layout.addLayout(self._actions())
         layout.addWidget(self._progress_group())
@@ -214,16 +265,15 @@ class MainWindow(QMainWindow):
     def _source_group(self) -> QGroupBox:
         box = QGroupBox("Source")
         v = QVBoxLayout(box)
+        v.setSpacing(theme.GAP_TIGHT)
 
         self.drop_label = QLabel("Drop a video or image here, or use Browse")
         self.drop_label.setAlignment(Qt.AlignCenter)
         self.drop_label.setWordWrap(True)
         self.drop_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.drop_label.setMinimumHeight(70)
-        self.drop_label.setStyleSheet(
-            "border: 2px dashed palette(mid); padding: 16px; border-radius: 6px;"
-        )
-        v.addWidget(with_help(self.drop_label, "source"))
+        self.drop_label.setObjectName("dropzone")
+        v.addWidget(with_help(self.drop_label, "source", top=True))
 
         browse = QPushButton("Browse...")
         browse.clicked.connect(self._browse_source)
@@ -234,22 +284,22 @@ class MainWindow(QMainWindow):
         self.analysis.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.analysis.setAlignment(Qt.AlignTop)
         self.analysis.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        v.addWidget(with_help(self.analysis, "analysis"), 1)
+        self.analysis.setObjectName("analysis")
+        v.addWidget(with_help(self.analysis, "analysis", top=True), 1)
         return box
 
     def _model_group(self) -> QGroupBox:
         box = QGroupBox("Model")
-        f = QFormLayout(box)
-        f.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        f = form(box)
         self.model_combo = QComboBox()
         self.model_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._reload_models()
         self.model_combo.currentIndexChanged.connect(self._show_model_note)
-        f.addRow("Weights", with_help(self.model_combo, "model"))
+        f.addRow(field_label("Weights"), with_help(self.model_combo, "model"))
 
         self.model_note = QLabel("")
         self.model_note.setWordWrap(True)
-        self.model_note.setStyleSheet("color: palette(mid); font-size: 11px;")
+        self.model_note.setObjectName("hint")
         f.addRow("", self.model_note)
         self._show_model_note()
 
@@ -260,29 +310,28 @@ class MainWindow(QMainWindow):
 
     def _texture_group(self) -> QGroupBox:
         box = QGroupBox("Restoration and texture")
-        f = QFormLayout(box)
-        f.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        f = form(box)
 
         self.no_restore = QCheckBox("Skip all restoration (fastest, for previews)")
         f.addRow("", with_help(self.no_restore, "no_restore"))
 
         self.degrain = _slider(0, 100, 25)
-        f.addRow("Degrain", self._labelled(
+        f.addRow(field_label("Degrain"), self._labelled(
             self.degrain, "degrain",
             "higher removes more grain — and more skin texture"))
 
         self.detail = _slider(0, 100, 25)
-        f.addRow("Detail retention", self._labelled(
+        f.addRow(field_label("Detail retention"), self._labelled(
             self.detail, "detail",
             "restores real detail from your source file"))
 
         self.regrain = _slider(0, 100, 60)
-        f.addRow("Re-grain", self._labelled(
+        f.addRow(field_label("Re-grain"), self._labelled(
             self.regrain, "regrain",
             "the strongest fix for plastic-looking skin"))
 
         self.deblock = _slider(0, 100, 0)
-        f.addRow("Deblock", self._labelled(
+        f.addRow(field_label("Deblock"), self._labelled(
             self.deblock, "deblock",
             "raise for YouTube and low-bitrate sources"))
         return box
@@ -295,7 +344,9 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         value = QLabel(f"{slider.value() / 100:.2f}")
-        value.setFixedWidth(34)
+        value.setObjectName("value")
+        value.setFixedWidth(36)
+        value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         slider.valueChanged.connect(lambda n: value.setText(f"{n / 100:.2f}"))
         slider.setToolTip(HELP.get(key, ""))
         row.addWidget(slider, 1)
@@ -304,14 +355,13 @@ class MainWindow(QMainWindow):
         v.addLayout(row)
         note = QLabel(hint)
         note.setWordWrap(True)
-        note.setStyleSheet("color: palette(mid); font-size: 11px;")
+        note.setObjectName("hint")
         v.addWidget(note)
         return w
 
     def _fps_group(self) -> QGroupBox:
         box = QGroupBox("Frame rate (make motion smoother)")
-        f = QFormLayout(box)
-        f.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        f = form(box)
 
         self.fps_mode = QComboBox()
         self.fps_mode.addItems(["Off", "Target FPS", "Multiplier"])
@@ -321,7 +371,7 @@ class MainWindow(QMainWindow):
             "Multiply whatever the source happens to be, such as 2x.",
         ]):
             self.fps_mode.setItemData(i, note, Qt.ToolTipRole)
-        f.addRow("Mode", with_help(self.fps_mode, "fps_mode"))
+        f.addRow(field_label("Mode"), with_help(self.fps_mode, "fps_mode"))
 
         self.fps_target = QComboBox()
         self.fps_target.setEditable(True)
@@ -334,34 +384,33 @@ class MainWindow(QMainWindow):
         ]):
             self.fps_target.setItemData(i, note, Qt.ToolTipRole)
         self.fps_target.setCurrentText("60")
-        f.addRow("Target", with_help(self.fps_target, "fps_target"))
+        f.addRow(field_label("Target"), with_help(self.fps_target, "fps_target"))
 
         self.fps_multiplier = QDoubleSpinBox()
         self.fps_multiplier.setRange(1.0, 8.0)
         self.fps_multiplier.setValue(2.0)
-        f.addRow("Multiplier", with_help(self.fps_multiplier, "fps_multiplier"))
+        f.addRow(field_label("Multiplier"), with_help(self.fps_multiplier, "fps_multiplier"))
 
         self.scene_threshold = QDoubleSpinBox()
         self.scene_threshold.setRange(0.0, 1.0)
         self.scene_threshold.setSingleStep(0.05)
         self.scene_threshold.setValue(0.30)
-        f.addRow("Cut sensitivity", with_help(self.scene_threshold, "scene_threshold"))
+        f.addRow(field_label("Cut sensitivity"), with_help(self.scene_threshold, "scene_threshold"))
 
         self.fps_note = QLabel("")
         self.fps_note.setWordWrap(True)
-        self.fps_note.setStyleSheet("color: palette(mid); font-size: 11px;")
+        self.fps_note.setObjectName("hint")
         f.addRow("", self.fps_note)
         self._check_rife()
         return box
 
     def _output_group(self) -> QGroupBox:
         box = QGroupBox("Output")
-        f = QFormLayout(box)
-        f.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        f = form(box)
 
         self.output_label = QLabel("(chosen automatically beside the source)")
         self.output_label.setWordWrap(True)
-        f.addRow("File", with_help(self.output_label, "output"))
+        f.addRow(field_label("File"), with_help(self.output_label, "output", top=True))
 
         pick = QPushButton("Choose output...")
         pick.clicked.connect(self._browse_output)
@@ -370,7 +419,7 @@ class MainWindow(QMainWindow):
         self.segment_frames = QSpinBox()
         self.segment_frames.setRange(30, 10000)
         self.segment_frames.setValue(500)
-        f.addRow("Segment frames", with_help(self.segment_frames, "segment_frames"))
+        f.addRow(field_label("Segment frames"), with_help(self.segment_frames, "segment_frames"))
 
         self.vram_budget = QComboBox()
         for label, mb in VRAM_CHOICES:
@@ -384,7 +433,7 @@ class MainWindow(QMainWindow):
                 "stays usable. Slower, but never fails.",
                 Qt.ToolTipRole,
             )
-        f.addRow("Graphics memory", with_help(self.vram_budget, "vram_budget"))
+        f.addRow(field_label("Graphics memory"), with_help(self.vram_budget, "vram_budget"))
 
         self.cpu = QCheckBox("Force CPU (very slow)")
         f.addRow("", with_help(self.cpu, "cpu"))
@@ -393,6 +442,7 @@ class MainWindow(QMainWindow):
     def _queue_group(self) -> QGroupBox:
         box = QGroupBox("Queue")
         v = QVBoxLayout(box)
+        v.setSpacing(theme.GAP_TIGHT)
 
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
@@ -409,19 +459,22 @@ class MainWindow(QMainWindow):
         v.addLayout(top)
 
         row = QHBoxLayout()
+        row.setSpacing(theme.GAP_TIGHT)
         for label, key, slot in [
             ("Start", "queue_start", self._queue_start),
             ("Stop", "queue_stop", self._queue_stop),
             ("Remove", "queue_remove", self._queue_remove),
-            ("Clear finished", "queue_clear", self._queue_clear),
+            ("Clear", "queue_clear", self._queue_clear),
         ]:
             button = QPushButton(label)
             button.setToolTip(HELP[key])
             button.clicked.connect(slot)
             setattr(self, f"btn_{key}", button)
-            row.addWidget(button)
-            row.addWidget(help_button(key))
-        row.addStretch(1)
+            # Equal widths so the row reads as one control group rather than
+            # four buttons of arbitrary size. Each carries its own tooltip, so
+            # a separate marker per button would only add clutter.
+            button.setMinimumWidth(72)
+            row.addWidget(button, 1)
         v.addLayout(row)
         return box
 
@@ -464,14 +517,15 @@ class MainWindow(QMainWindow):
 
     def _actions(self) -> QHBoxLayout:
         row = QHBoxLayout()
-        self.guide_button = QPushButton("Guide / Help")
-        self.guide_button.setToolTip("Open a page explaining every setting.")
+        row.setSpacing(theme.GAP_TIGHT)
+        self.guide_button = QPushButton("Guide")
+        self.guide_button.setToolTip(HELP["guide_button"])
         self.guide_button.clicked.connect(self._open_guide)
-        row.addWidget(self.guide_button)
         self.preview_button = QPushButton(f"Preview {PREVIEW_SECONDS}s")
         self.preview_button.setToolTip(HELP["preview_button"])
         self.preview_button.clicked.connect(lambda: self._start(preview=True))
         self.render_button = QPushButton("Render")
+        self.render_button.setObjectName("primary")
         self.render_button.setToolTip(HELP["render_button"])
         self.render_button.clicked.connect(lambda: self._start(preview=False))
         self.cancel_button = QPushButton("Cancel")
@@ -479,17 +533,23 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel)
 
-        row.addWidget(self.preview_button, 1)
-        row.addWidget(help_button("preview_button"))
-        row.addWidget(self.render_button, 1)
-        row.addWidget(help_button("render_button"))
-        row.addWidget(self.cancel_button, 1)
-        row.addWidget(help_button("cancel_button"))
+        # Guide sits apart on the left; the three actions group on the right in
+        # the order they are used. Every button carries its own tooltip, so no
+        # separate markers here — interleaving them made the row unreadable.
+        for button in (self.preview_button, self.render_button, self.cancel_button):
+            button.setMinimumWidth(110)
+
+        row.addWidget(self.guide_button)
+        row.addStretch(1)
+        row.addWidget(self.preview_button)
+        row.addWidget(self.render_button)
+        row.addWidget(self.cancel_button)
         return row
 
     def _progress_group(self) -> QGroupBox:
         box = QGroupBox("Progress")
         v = QVBoxLayout(box)
+        v.setSpacing(theme.GAP_TIGHT)
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
         self.bar = QProgressBar()
@@ -498,6 +558,7 @@ class MainWindow(QMainWindow):
         v.addLayout(top)
 
         self.status = QLabel("Idle.")
+        self.status.setObjectName("status")
         v.addWidget(self.status)
 
         self.log_view = QPlainTextEdit()
@@ -889,9 +950,29 @@ class MainWindow(QMainWindow):
     def _append(self, text: str) -> None:
         self.log_view.appendPlainText(text)
 
+    def bring_to_front(self) -> None:
+        """Raise and focus, for when the shortcut is used a second time."""
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
 
 def launch(argv: list[str] | None = None) -> int:
+    from .single import InstanceServer, another_instance_running
+
     app = QApplication(argv or [])
+
+    if another_instance_running():
+        # The running copy has been asked to come forward; nothing more to do.
+        return 0
+
+    theme.apply(app)
+    guard = InstanceServer()
     window = MainWindow()
+    guard.raise_requested.connect(window.bring_to_front)
     window.show()
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        guard.close()

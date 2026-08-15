@@ -37,3 +37,13 @@ def synthetic_clip_with_audio(tmp_path):
         check=True,
     )
     return path
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    """A single QApplication for tests that need a Qt event loop."""
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    return app
