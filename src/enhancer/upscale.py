@@ -39,6 +39,7 @@ class Upscaler:
         overlap: int,
         device: str | torch.device = "cuda",
         half: bool = True,
+        vram_budget: int | None = None,
     ) -> None:
         self.model = model
         self.device = torch.device(device)
@@ -61,7 +62,15 @@ class Upscaler:
                     "this tier in fp32, which will be slower",
                     getattr(model, "arch", type(model).__name__), model_dtype,
                 )
-        ceiling = physical_vram_ceiling(total_vram_bytes()) if self.device.type == "cuda" else None
+        if self.device.type != "cuda":
+            ceiling = None
+        elif vram_budget is not None:
+            # An explicit cap, so the machine stays usable for other work. The
+            # render slows when it bites, but never fails: tiles shrink and the
+            # per-frame CPU fallback remains in place underneath.
+            ceiling = max(1, int(vram_budget))
+        else:
+            ceiling = physical_vram_ceiling(total_vram_bytes())
         self.runner = TileRunner(
             tile=tile, overlap=overlap, scale=model.scale,
             min_tile=128, vram_ceiling=ceiling,

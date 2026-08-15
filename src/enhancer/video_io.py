@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+
+from . import proc
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -45,7 +47,7 @@ class SourceProfile:
     @classmethod
     def probe(cls, path: str | Path) -> "SourceProfile":
         path = Path(path)
-        out = subprocess.run(
+        out = proc.run(
             [
                 "ffprobe", "-v", "error", "-print_format", "json",
                 "-show_streams", "-show_format", str(path),
@@ -133,19 +135,19 @@ class Decoder:
     def frames(self) -> Iterator[np.ndarray]:
         p = self.profile
         frame_bytes = p.width * p.height * 3
-        proc = subprocess.Popen(
+        process = proc.popen(
             self._command(), stdout=subprocess.PIPE, bufsize=frame_bytes * 4
         )
         try:
             while True:
-                buf = proc.stdout.read(frame_bytes)
+                buf = process.stdout.read(frame_bytes)
                 if len(buf) < frame_bytes:
                     break
                 yield np.frombuffer(buf, np.uint8).reshape(p.height, p.width, 3)
         finally:
-            if proc.stdout:
-                proc.stdout.close()
-            proc.wait()
+            if process.stdout:
+                process.stdout.close()
+            process.wait()
 
 
 class Encoder:
@@ -210,7 +212,7 @@ class Encoder:
         return cmd
 
     def __enter__(self) -> "Encoder":
-        self._proc = subprocess.Popen(self._build_command(), stdin=subprocess.PIPE)
+        self._proc = proc.popen(self._build_command(), stdin=subprocess.PIPE)
         return self
 
     def write(self, frame: np.ndarray) -> None:

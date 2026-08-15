@@ -173,3 +173,31 @@ def test_half_requested_but_float32_model_does_not_crash_on_cuda(rng):
     assert up.half is False
     out = up.process(frame)  # must not raise
     assert out.shape == (64, 64, 3)
+
+
+def test_vram_budget_caps_the_ceiling():
+    """An explicit cap keeps the machine usable for other work."""
+    up = Upscaler(FakeModel(), tile=256, overlap=0, device="cpu",
+                  vram_budget=512 * 1024 ** 2)
+    # On CPU there is no ceiling at all; the budget only applies to CUDA.
+    assert up.runner.vram_ceiling is None
+
+
+@pytest.mark.gpu
+def test_vram_budget_is_used_instead_of_the_physical_ceiling():
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    budget = 512 * 1024 ** 2
+    up = Upscaler(FakeModel(), tile=256, overlap=0, device="cuda",
+                  half=False, vram_budget=budget)
+    assert up.runner.vram_ceiling == budget
+
+
+@pytest.mark.gpu
+def test_no_budget_falls_back_to_the_physical_ceiling():
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from enhancer.vram import physical_vram_ceiling, total_vram_bytes
+
+    up = Upscaler(FakeModel(), tile=256, overlap=0, device="cuda", half=False)
+    assert up.runner.vram_ceiling == physical_vram_ceiling(total_vram_bytes())

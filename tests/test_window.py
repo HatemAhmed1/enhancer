@@ -284,3 +284,89 @@ def test_guide_leads_with_problem_fixes(window):
 
 def test_guide_button_exists(window):
     assert window.guide_button.isEnabled()
+
+
+# --- queue and memory control ----------------------------------------------
+
+
+def test_queue_starts_empty(window):
+    assert window.queue_view.rowCount() == 0
+    assert len(window.queue) == 0
+
+
+def test_queue_has_start_stop_remove_clear(window):
+    for name in ("btn_queue_start", "btn_queue_stop",
+                 "btn_queue_remove", "btn_queue_clear"):
+        assert hasattr(window, name), name
+
+
+def test_queue_buttons_all_explain_themselves(window):
+    for name in ("btn_queue_start", "btn_queue_stop",
+                 "btn_queue_remove", "btn_queue_clear"):
+        assert len(getattr(window, name).toolTip()) > 30
+
+
+def test_stop_and_remove_are_disabled_with_an_empty_queue(window):
+    window._refresh_queue()
+    assert not window.btn_queue_stop.isEnabled()
+    assert not window.btn_queue_remove.isEnabled()
+
+
+def test_queued_jobs_appear_as_rows(window, synthetic_clip, tmp_path):
+    from enhancer.requests import RenderRequest
+
+    for name in ("a.mkv", "b.mkv"):
+        window.queue.add(RenderRequest(
+            model=tmp_path / "m.pth", source=tmp_path / name,
+            output=tmp_path / "out.mkv"))
+    window._refresh_queue()
+    assert window.queue_view.rowCount() == 2
+    assert window.queue_view.item(0, 0).text() == "a.mkv"
+    assert window.queue_view.item(0, 1).text() == "Waiting"
+
+
+def test_clear_finished_removes_only_finished_rows(window, tmp_path):
+    from enhancer.requests import RenderRequest
+
+    def add(name):
+        return window.queue.add(RenderRequest(
+            model=tmp_path / "m.pth", source=tmp_path / name,
+            output=tmp_path / "out.mkv"))
+
+    waiting, done = add("wait.mkv"), add("done.mkv")
+    window.queue.finish(done)
+    window._queue_clear()
+    assert window.queue_view.rowCount() == 1
+    assert window.queue_view.item(0, 0).text() == "wait.mkv"
+
+
+def test_memory_cap_offers_automatic_and_explicit_limits(window):
+    labels = [window.vram_budget.itemText(i) for i in range(window.vram_budget.count())]
+    assert labels[0] == "Automatic"
+    assert len(labels) > 2
+
+
+def test_automatic_memory_cap_means_no_budget(window):
+    window.vram_budget.setCurrentIndex(0)
+    assert window._selected_vram_budget() is None
+
+
+def test_explicit_memory_cap_converts_to_bytes(window):
+    window.vram_budget.setCurrentIndex(1)
+    assert window._selected_vram_budget() == 2048 * 1024 ** 2
+
+
+def test_memory_cap_reaches_the_request(window, synthetic_clip, tmp_path):
+    window._load_source(synthetic_clip)
+    window.model_combo.clear()
+    window.model_combo.addItem("m.pth", str(tmp_path / "m.pth"))
+    window.output_label.setText(str(tmp_path / "out.mkv"))
+    window.vram_budget.setCurrentIndex(1)
+    assert window._build_request(preview=False).vram_budget == 2048 * 1024 ** 2
+
+
+def test_every_memory_option_is_explained(window):
+    from PySide6.QtCore import Qt
+
+    for i in range(window.vram_budget.count()):
+        assert window.vram_budget.itemData(i, Qt.ToolTipRole)

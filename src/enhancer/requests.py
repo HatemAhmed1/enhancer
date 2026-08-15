@@ -40,6 +40,10 @@ class RenderRequest:
     cpu: bool = False
     segment_frames: int = 500
 
+    # Cap on graphics memory, in bytes. None means use whatever is free,
+    # leaving the standard headroom for the desktop.
+    vram_budget: int | None = None
+
     preview_frames: int | None = None
     job_dir: Path | None = None
 

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import proc
 from .video_io import Encoder, SourceProfile
 
 SEGMENT_SUFFIX = ".mkv"
@@ -99,5 +100,5 @@ def assemble(
         "-c", "copy",
         str(output),
     ]
-    subprocess.run(cmd, check=True)
+    proc.run(cmd, check=True)
     return output

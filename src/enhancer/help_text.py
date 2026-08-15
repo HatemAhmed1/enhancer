@@ -1,10 +1,13 @@
 """Explanatory text for the interface.
 
-Kept out of the widget code so it can be tested, reviewed and corrected without
-touching Qt, and so the same wording can be reused by any other front end.
+Kept out of the widget code so the wording can be tested and revised without
+touching Qt, and reused by any other front end.
 
-Every control the user can touch must have an entry here. `test_help_text.py`
-enforces that, so adding a control without explaining it fails the suite.
+Every control must have an entry. `test_help_text.py` enforces that, so adding
+a control without explaining it fails the suite.
+
+House style: lead with what it does in one line, then why it matters, then
+concrete values. No jargon, no lecturing.
 """
 
 from __future__ import annotations
@@ -12,208 +15,193 @@ from __future__ import annotations
 # Keys match the control names used in `window.py`.
 HELP: dict[str, str] = {
     "source": (
-        "The video or image you want to enlarge.\n\n"
-        "Video: .mp4, .mkv, .mov, .avi, .webm\n"
-        "Images: .png, .jpg, .webp (transparency is preserved)\n\n"
-        "Drop a file here, or click Browse."
+        "The file to enlarge.\n\n"
+        "Video: mp4, mkv, mov, avi, webm\n"
+        "Images: png, jpg, webp — transparency kept\n\n"
+        "Drop it here, or click Browse."
     ),
     "analysis": (
-        "What was found in your file, checked automatically.\n\n"
-        "The Scan line matters most:\n\n"
-        "• progressive — a normal modern file, nothing to correct.\n\n"
-        "• telecined — film transferred to video, common on DVDs of older "
-        "movies. The original film frames are recovered exactly. This is not "
-        "the same as interlaced, and treating it as such would soften every "
-        "frame permanently.\n\n"
-        "• interlaced — genuine video, typically from TV or camcorders. Gets a "
-        "different correction.\n\n"
-        "Blockiness above about 2 means the file was compressed hard; raise "
-        "Deblock. Grain above about 8 means a grainy film print."
+        "What was detected in your file.\n\n"
+        "Scan says which correction is applied:\n"
+        "progressive — none needed\n"
+        "telecined — film on video; original frames recovered\n"
+        "interlaced — video; deinterlaced\n\n"
+        "Blockiness over 2: raise Deblock.\n"
+        "Grain over 8: a grainy film print."
     ),
     "model": (
-        "The AI model that does the enlarging.\n\n"
-        "This choice affects speed far more than anything else here — the "
-        "slowest model is roughly ten times slower than the fastest.\n\n"
-        "Hover any entry in the list for what it suits. If unsure, start with "
-        "2xParimgCompact."
+        "The AI model doing the enlarging.\n\n"
+        "Affects speed more than everything else here combined — the slowest "
+        "is roughly ten times the fastest.\n\n"
+        "Hover any entry for what it suits. Start with 2xParimgCompact."
     ),
     "rescan": (
-        "Re-read the models\\custom folder.\n\n"
-        "Use this after dropping in a new .pth file, so you do not have to "
-        "restart the app."
+        "Re-read the models folder after adding a file.\n\n"
+        "Saves restarting the app."
     ),
     "no_restore": (
-        "Turn off all cleanup and texture work — just enlarge.\n\n"
-        "About 35% faster, and useful for a quick look at what the model alone "
-        "does. Leave it off for a real render: without re-grain, skin tends to "
-        "look plastic."
+        "Enlarge only — no cleanup, no texture work.\n\n"
+        "About 35% faster. Useful for seeing what the model does alone. "
+        "Leave it off for a real render, or skin tends to look plastic."
     ),
     "degrain": (
-        "Removes noise and film grain BEFORE enlarging.\n\n"
-        "Some is necessary, because the model would otherwise magnify grain "
-        "into ugly digital noise.\n\n"
-        "But this is the control most likely to ruin skin. Grain and skin "
-        "micro-texture sit at the same level of fine detail, so removing one "
-        "removes the other. Too much of this is what makes faces look "
-        "airbrushed.\n\n"
-        "If skin looks waxy, LOWER this first.\n\n"
-        "0.10 — grainy film you want to keep looking like film\n"
-        "0.25 — sensible default\n"
-        "0.50 — noisy video sources, VHS captures"
+        "Removes noise and grain before enlarging.\n\n"
+        "Some is needed, or the model magnifies grain into digital noise. But "
+        "grain and skin texture are the same size of detail, so removing one "
+        "removes the other. This is the usual cause of waxy faces.\n\n"
+        "Waxy skin? Lower this first.\n\n"
+        "0.10 grainy film · 0.25 default · 0.50 noisy video"
     ),
     "detail": (
-        "Puts the source's own fine detail back over the enlarged frame.\n\n"
-        "This is the only control that restores real photographed texture "
-        "rather than texture the model invented. It takes the fine detail out "
-        "of your original file and lays it back on top, so it physically "
-        "cannot make up pores or hairs that were never there.\n\n"
-        "If skin looks smooth or plastic, RAISE this.\n\n"
-        "0.25 — sensible default\n"
-        "0.40 — faces and close-ups\n"
-        "0.60 — very soft or blurry sources"
+        "Lays your source's own fine detail back over the result.\n\n"
+        "The only control that restores real texture rather than texture the "
+        "model invented. It cannot add pores that were never there.\n\n"
+        "Skin too smooth? Raise this.\n\n"
+        "0.25 default · 0.40 faces · 0.60 soft sources"
     ),
     "regrain": (
-        "Adds fine film grain back AFTER enlarging.\n\n"
-        "AI models strip the faint texture of skin because it looks like noise "
-        "to them. Putting grain back is the single strongest thing you can do "
-        "to stop faces looking like plastic.\n\n"
-        "Grain is strongest in mid-tones and fades out in bright and dark "
-        "areas, the way real film behaves, and it changes every frame so it "
-        "moves rather than sitting still like dirt on the lens.\n\n"
-        "0.60 — sensible default\n"
-        "0.80 — old film prints, or if skin still looks too clean\n"
-        "0.20 — modern digital footage that was never grainy"
+        "Adds fine grain after enlarging.\n\n"
+        "Models strip the faint texture of skin as if it were noise. Putting "
+        "grain back is the strongest fix for plastic-looking faces.\n\n"
+        "Strongest in mid-tones, fading in highlights and shadows, and it "
+        "moves between frames rather than sitting still.\n\n"
+        "0.60 default · 0.80 old film · 0.20 modern digital"
     ),
     "deblock": (
-        "Removes the blocky squares and mosquito-like fuzz left by heavy "
-        "compression.\n\n"
-        "Off by default, because it softens the picture slightly and clean "
-        "sources do not need it. Turn it up when the Blockiness reading above "
-        "is high.\n\n"
-        "0.00 — Blu-ray, clean digital files\n"
-        "0.30 — YouTube downloads, streaming rips\n"
-        "0.50 — VCD, low-bitrate rips, old web video"
+        "Removes compression blocks and edge fuzz.\n\n"
+        "Off by default: it softens slightly, and clean files do not need it. "
+        "Raise it when Blockiness above reads high.\n\n"
+        "0.00 Blu-ray · 0.30 YouTube · 0.50 VCD and low-bitrate rips"
     ),
     "fps_mode": (
-        "Makes motion smoother by inventing extra in-between frames.\n\n"
-        "Nothing is lost — your original frames are kept exactly as they are, "
-        "and new ones are added between them.\n\n"
-        "Off — keep the original frame rate\n"
-        "Target FPS — choose the exact result, e.g. 60\n"
-        "Multiplier — double or triple whatever the source happens to be\n\n"
-        "This roughly doubles render time, and needs RIFE weights installed."
+        "Smoother motion, by adding frames between the existing ones.\n\n"
+        "Your original frames are kept unchanged.\n\n"
+        "Off · Target FPS names the result · Multiplier scales the source\n\n"
+        "Roughly doubles render time."
     ),
     "fps_target": (
-        "The frame rate you want out.\n\n"
-        "60 — smooth playback on a normal screen, the usual choice\n"
-        "48 — a gentler lift from 24, keeps some of the cinema feel\n"
-        "50 — for PAL sources and European TVs\n"
-        "120 — high refresh-rate screens, or for slow motion later\n\n"
-        "Awkward ratios are fine: 24 to 60 is 2.5 times, which works properly "
-        "here rather than being rounded off."
+        "Frame rate out.\n\n"
+        "60 usual choice · 48 keeps a cinema feel · 50 for PAL · "
+        "120 for high-refresh screens or slow motion\n\n"
+        "Uneven ratios work: 24 to 60 is 2.5 times."
     ),
     "fps_multiplier": (
-        "Multiply the source rate instead of naming a target.\n\n"
-        "2 — twice as smooth (24 becomes 48, 25 becomes 50)\n"
-        "3 — three times\n"
-        "4 — four times, for slow motion\n\n"
-        "Useful when you do not know or care what the source rate is."
+        "Scale the source rate instead of naming a target.\n\n"
+        "2 doubles it (24 becomes 48) · 3 · 4 for slow motion\n\n"
+        "Use when the source rate does not matter to you."
     ),
     "scene_threshold": (
-        "How eagerly the app spots a cut between shots.\n\n"
-        "This matters for fast-cut footage like song and dance sequences. "
-        "Inventing a frame ACROSS a cut would smear two unrelated shots into "
-        "each other, which looks awful. At a cut, a real frame is repeated "
-        "instead — invisible to the eye.\n\n"
-        "0.30 — sensible default\n"
-        "0.20 — very fast cutting, if you see smearing at cuts\n"
-        "0.45 — long unbroken takes, if real motion is being mistaken for cuts"
+        "How readily a cut between shots is detected.\n\n"
+        "Matters for fast-cut footage. Adding a frame across a cut smears two "
+        "unrelated shots together; at a cut, a real frame is repeated instead.\n\n"
+        "0.30 default · 0.20 fast cutting, if you see smearing · 0.45 long takes"
     ),
     "output": (
-        "Where the finished file goes.\n\n"
-        ".mkv is recommended: it holds 10-bit video, audio and subtitles "
-        "without fuss. For images, the extension you type decides the format."
+        "Where the result is written.\n\n"
+        "mkv carries 10-bit video, audio and subtitles cleanly. For images, "
+        "the extension sets the format."
     ),
     "segment_frames": (
-        "How much work you lose if the render is interrupted.\n\n"
-        "The output is written in chunks. If the app closes, the machine "
-        "sleeps, or you press Cancel, finished chunks are kept and the render "
-        "picks up from there.\n\n"
-        "500 — sensible default, about three minutes of lost work at worst\n"
-        "Lower — lose less on interruption, marginally slower overall"
+        "How much work an interruption costs.\n\n"
+        "Output is written in chunks. Finished chunks survive closing the app, "
+        "sleeping, or pressing Stop, and the render continues from there.\n\n"
+        "500 default — about three minutes at worst."
+    ),
+    "vram_budget": (
+        "How much graphics memory the render may use.\n\n"
+        "Lower it to keep the machine usable for other things; the render "
+        "slows but never fails. Raise it for full speed on an idle machine.\n\n"
+        "Running short is handled automatically either way."
     ),
     "cpu": (
-        "Run on the processor instead of the graphics card.\n\n"
-        "Dramatically slower — think tens of times, not a bit. Only useful if "
-        "the graphics card is unavailable or you need it for something else.\n\n"
-        "You do not need this to avoid running out of graphics memory: that is "
-        "handled automatically."
+        "Use the processor instead of the graphics card.\n\n"
+        "Tens of times slower. Only for machines without a usable GPU.\n\n"
+        "Not needed to avoid running out of graphics memory — that is already "
+        "handled."
     ),
     "preview_button": (
-        "Render about ten seconds, so you can judge the settings.\n\n"
-        "Do this every time. A full film takes many hours; ten seconds takes "
-        "under a minute and answers the same question.\n\n"
-        "Open the result next to your original and look at a face you know "
-        "well. If the skin looks airbrushed: lower Degrain, raise Detail "
-        "retention, raise Re-grain."
+        "Render about ten seconds to judge the settings.\n\n"
+        "Worth doing every time. A full film takes hours; this takes under a "
+        "minute and answers the same question.\n\n"
+        "Compare it with the original on a face you know."
     ),
     "render_button": (
-        "Render the whole file.\n\n"
-        "Safe to leave running overnight. If it is interrupted for any reason, "
-        "reopen the app with the same settings and press Render again — it "
-        "continues from where it stopped."
+        "Add these settings to the queue and start.\n\n"
+        "Safe to leave overnight. If interrupted, start it again with the same "
+        "settings and it continues from where it stopped."
     ),
     "cancel_button": (
         "Stop after the current frame.\n\n"
-        "Nothing already finished is thrown away. Press Render again later "
-        "with the same settings and it carries on."
+        "Finished work is kept. Start again later to continue."
     ),
     "progress": (
-        "Frames done, current speed, and estimated time left.\n\n"
-        "The estimate settles down after the first minute or so. If the speed "
-        "is far lower than expected, a faster model is usually the answer."
+        "Frames done, current speed, time remaining.\n\n"
+        "The estimate settles after the first minute. Much slower than "
+        "expected usually means the model is too heavy — try a 2x one."
     ),
+    "queue": (
+        "Jobs waiting, running and finished.\n\n"
+        "One runs at a time. Two would compete for the same graphics memory "
+        "and both would be slower.\n\n"
+        "Select a row to stop or remove it."
+    ),
+    "queue_start": (
+        "Start the next waiting job, or restart the selected one.\n\n"
+        "A job that was stopped continues from where it left off."
+    ),
+    "queue_stop": (
+        "Stop the running job after the current frame.\n\n"
+        "Progress is kept — starting it again continues from there."
+    ),
+    "queue_remove": (
+        "Remove the selected job from the list.\n\n"
+        "Stop a running job first. Files already written are left alone."
+    ),
+    "queue_clear": (
+        "Clear finished, stopped and failed jobs from the list.\n\n"
+        "Waiting and running jobs stay."
+    ),
+    "guide_button": "Open a page explaining every setting.",
 }
 
 
-# Matched against the model file name, longest match first.
+# Matched against the model file name.
 MODEL_NOTES: dict[str, str] = {
     "2xParimgCompact": (
-        "FASTEST. Doubles size.\n\n"
-        "Best for: full-length films, anything where you need it finished "
-        "today. General-purpose, handles live action well.\n\n"
-        "Roughly 19 frames per second at DVD resolution."
+        "Fastest. Doubles size.\n\n"
+        "Best for: full-length films, anything you want finished today. "
+        "General purpose, good on live action.\n\n"
+        "About 19 frames a second at DVD size."
     ),
     "2xModernSpanimationV1": (
-        "FAST. Doubles size.\n\n"
-        "Best for: animation and cartoons, and clean live action. Slightly "
-        "slower than Compact, often a little cleaner on flat colour.\n\n"
-        "Roughly 14 frames per second at DVD resolution."
+        "Fast. Doubles size.\n\n"
+        "Best for: animation, and clean live action. A little slower than "
+        "Compact, often cleaner on flat colour.\n\n"
+        "About 14 frames a second at DVD size."
     ),
     "4xNomos2_realplksr_dysample": (
-        "BEST TEXTURE, but slow. Quadruples size.\n\n"
-        "Best for: close-ups, faces, short clips where skin detail is the "
-        "whole point. Not practical for a full film.\n\n"
-        "Note: this one cannot use the graphics card's fast mode, so it runs "
-        "several times slower than its size suggests."
+        "Best texture, but slow. Quadruples size.\n\n"
+        "Best for: close-ups and faces, short clips where skin detail is the "
+        "point. Not practical for a full film.\n\n"
+        "Cannot use the card's fast mode, so slower than its size suggests."
     ),
     "4xPurePhoto-span": (
         "Quadruples size. Photographic look.\n\n"
-        "Best for: photographs and stills. Usable on short video clips.\n\n"
-        "Remember a 4x model does four times the work of a 2x one — for a "
-        "1080p source, 2x already reaches 4K."
+        "Best for: photographs and stills; short video clips.\n\n"
+        "A 4x model does four times the work of a 2x one. For 1080p, 2x "
+        "already reaches 4K."
     ),
     "realesr-general-x4v3": (
         "Quadruples size. Tolerant of poor sources.\n\n"
         "Best for: heavily compressed video — YouTube rips, old web video, "
-        "VCD. Copes with artifacts better than most.\n\n"
-        "Fast for a 4x model, but still four times the work of a 2x one."
+        "VCD. Handles artifacts better than most.\n\n"
+        "Fast for a 4x model, but still four times a 2x one."
     ),
     "RealESRGAN_x2plus": (
-        "SLOWEST, highest fidelity. Doubles size.\n\n"
+        "Slowest, highest fidelity. Doubles size.\n\n"
         "Best for: single photographs and short hero shots.\n\n"
-        "Not usable for a full film: roughly 2 frames per second at DVD "
-        "resolution, which is over a day for a feature."
+        "Too slow for a film: about 2 frames a second at DVD size, over a day "
+        "for a feature."
     ),
 }
 
@@ -221,7 +209,7 @@ ARCH_NOTES: dict[str, str] = {
     "compact": "Compact architecture — the fastest family. Good general choice.",
     "span": "SPAN architecture — fast, clean results.",
     "plksr": "PLKSR architecture — excellent texture, noticeably slower.",
-    "esrgan": "ESRGAN architecture — high quality but very slow on video.",
+    "esrgan": "ESRGAN architecture — high quality, very slow on video.",
     "dat": "DAT architecture — very high quality, very slow.",
     "swinir": "SwinIR architecture — high quality, very slow.",
 }
@@ -231,11 +219,11 @@ ARCH_NOTES: dict[str, str] = {
 GUIDE_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
     ("Getting started", [
         ("Source", "source"),
-        ("What was found in your file", "analysis"),
+        ("What was detected", "analysis"),
         ("Model", "model"),
         ("Rescan models", "rescan"),
     ]),
-    ("Making skin look real, not plastic", [
+    ("Skin texture", [
         ("Degrain", "degrain"),
         ("Detail retention", "detail"),
         ("Re-grain", "regrain"),
@@ -251,46 +239,56 @@ GUIDE_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
     ("Output and performance", [
         ("Output file", "output"),
         ("Segment frames", "segment_frames"),
+        ("Graphics memory", "vram_budget"),
         ("Force CPU", "cpu"),
     ]),
-    ("Running it", [
+    ("Running jobs", [
         ("Preview", "preview_button"),
         ("Render", "render_button"),
         ("Cancel", "cancel_button"),
         ("Progress", "progress"),
+        ("Queue", "queue"),
+        ("Start", "queue_start"),
+        ("Stop", "queue_stop"),
+        ("Remove", "queue_remove"),
+        ("Clear finished", "queue_clear"),
+        ("Guide", "guide_button"),
     ]),
 ]
 
 RECIPES = [
     (
         "Skin looks plastic or airbrushed",
-        "Lower Degrain to about 0.10, raise Detail retention to about 0.40, "
-        "and raise Re-grain to about 0.80. Degrain is almost always the cause.",
+        "Degrain to 0.10, Detail retention to 0.40, Re-grain to 0.80. "
+        "Degrain is almost always the cause.",
     ),
     (
-        "Picture looks blocky or has fuzzy edges",
-        "Raise Deblock to 0.30, or 0.50 for a very low-quality source. "
-        "Common with YouTube downloads and old rips.",
+        "Picture looks blocky, or edges look fuzzy",
+        "Deblock to 0.30, or 0.50 for a very poor source. Common with "
+        "YouTube downloads and old rips.",
     ),
     (
-        "It is far too slow",
-        "Switch to 2xParimgCompact, and prefer a 2x model over a 4x one. "
-        "For a 1080p source, 2x already reaches 4K. Model choice changes speed "
-        "roughly tenfold; nothing else here comes close.",
+        "Far too slow",
+        "Use 2xParimgCompact, and prefer a 2x model over a 4x one. For 1080p, "
+        "2x already reaches 4K. Model choice changes speed roughly tenfold.",
     ),
     (
-        "Motion looks smeared at cuts",
-        "Lower Cut sensitivity to about 0.20 so shot changes are spotted more "
-        "readily. Common in fast-cut song sequences.",
+        "Motion smears at cuts",
+        "Cut sensitivity to 0.20 so shot changes are spotted sooner. Common "
+        "in fast-cut song sequences.",
     ),
     (
-        "An old DVD looks combed or striped",
-        "Nothing to do — this is detected and corrected automatically. Check "
-        "the Scan line says telecined or interlaced rather than progressive.",
+        "Old DVD looks combed or striped",
+        "Nothing to do — detected and corrected automatically. Check the Scan "
+        "line reads telecined or interlaced rather than progressive.",
     ),
     (
-        "Result is too grainy",
-        "Lower Re-grain to about 0.30, and raise Degrain slightly to 0.35.",
+        "Too grainy",
+        "Re-grain to 0.30, Degrain up slightly to 0.35.",
+    ),
+    (
+        "Machine unusable while rendering",
+        "Lower Graphics memory. The render slows but stays reliable.",
     ),
 ]
 
@@ -317,6 +315,6 @@ def describe_model(name: str) -> str:
 
     return (
         "A model you added yourself.\n\n"
-        "Its architecture and scale are detected automatically when it loads. "
-        "Run a ten-second preview to see what it does and how fast it is."
+        "Its architecture and scale are detected when it loads. Run a "
+        "ten-second preview to see what it does and how fast it is."
     )

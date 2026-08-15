@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 import subprocess
+
+from . import proc
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -106,7 +108,7 @@ def classify_scan(analysis: FieldAnalysis) -> ScanType:
 
 def probe_scan(path: str | Path, frames: int = IDET_FRAMES) -> FieldAnalysis:
     """Run ffmpeg's idet filter over the opening frames of a source."""
-    result = subprocess.run(
+    result = proc.run(
         [
             "ffmpeg", "-nostdin", "-i", str(path),
             "-vf", "idet", "-frames:v", str(frames),

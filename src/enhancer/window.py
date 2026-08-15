@@ -28,6 +28,8 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -38,11 +40,21 @@ from .gui import CancelledError, RenderJob
 from .help_text import GUIDE_SECTIONS, HELP, MODEL_NOTES, RECIPES, describe_model
 from .jobs import SettingsMismatch
 from .models import scan_custom_dir
+from .queue import RenderQueue, Task, TaskState
 from .requests import RenderRequest
 from .video_io import Decoder, SourceProfile
 
 MEDIA_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".png", ".jpg", ".jpeg"}
 PREVIEW_SECONDS = 10
+
+# Graphics-memory caps offered in the Output panel, in megabytes.
+VRAM_CHOICES = [
+    ("Automatic", None),
+    ("2 GB — leave the machine free", 2048),
+    ("3 GB", 3072),
+    ("4 GB", 4096),
+    ("5 GB — maximum speed", 5120),
+]
 
 
 class Worker(QObject):
@@ -78,7 +90,8 @@ class Worker(QObject):
             self.log.emit(f"{model.arch}, scale {model.scale}x, tile {tile}")
 
             upscaler = Upscaler(
-                model, tile=tile, overlap=req.overlap, device=device, half=not req.cpu
+                model, tile=tile, overlap=req.overlap, device=device,
+                half=not req.cpu, vram_budget=req.vram_budget,
             )
 
             flow = None
@@ -157,6 +170,8 @@ class MainWindow(QMainWindow):
         self.thread: QThread | None = None
         self.worker: Worker | None = None
         self._started_at = 0.0
+        self.queue = RenderQueue()
+        self.active_task: Task | None = None
 
         # Landscape: settings in two columns side by side, progress spanning the
         # full width beneath. The splitter lets the columns be rebalanced, and
@@ -173,7 +188,7 @@ class MainWindow(QMainWindow):
         right_layout.setContentsMargins(6, 0, 0, 0)
         right_layout.addWidget(self._texture_group())
         right_layout.addWidget(self._fps_group())
-        right_layout.addStretch(1)
+        right_layout.addWidget(self._queue_group(), 1)
 
         self.columns = QSplitter(Qt.Horizontal)
         self.columns.addWidget(left)
@@ -357,8 +372,57 @@ class MainWindow(QMainWindow):
         self.segment_frames.setValue(500)
         f.addRow("Segment frames", with_help(self.segment_frames, "segment_frames"))
 
+        self.vram_budget = QComboBox()
+        for label, mb in VRAM_CHOICES:
+            self.vram_budget.addItem(label, mb)
+        self.vram_budget.setItemData(
+            0, "Use whatever is free, leaving room for the desktop.", Qt.ToolTipRole)
+        for i in range(1, self.vram_budget.count()):
+            self.vram_budget.setItemData(
+                i,
+                "Cap the render at this much graphics memory so the machine "
+                "stays usable. Slower, but never fails.",
+                Qt.ToolTipRole,
+            )
+        f.addRow("Graphics memory", with_help(self.vram_budget, "vram_budget"))
+
         self.cpu = QCheckBox("Force CPU (very slow)")
         f.addRow("", with_help(self.cpu, "cpu"))
+        return box
+
+    def _queue_group(self) -> QGroupBox:
+        box = QGroupBox("Queue")
+        v = QVBoxLayout(box)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        self.queue_view = QTableWidget(0, 4)
+        self.queue_view.setHorizontalHeaderLabels(["File", "Status", "Progress", "Note"])
+        self.queue_view.horizontalHeader().setStretchLastSection(True)
+        self.queue_view.setSelectionBehavior(QTableWidget.SelectRows)
+        self.queue_view.setSelectionMode(QTableWidget.SingleSelection)
+        self.queue_view.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.queue_view.setMinimumHeight(120)
+        self.queue_view.setToolTip(HELP["queue"])
+        top.addWidget(self.queue_view, 1)
+        top.addWidget(help_button("queue"), 0, Qt.AlignTop)
+        v.addLayout(top)
+
+        row = QHBoxLayout()
+        for label, key, slot in [
+            ("Start", "queue_start", self._queue_start),
+            ("Stop", "queue_stop", self._queue_stop),
+            ("Remove", "queue_remove", self._queue_remove),
+            ("Clear finished", "queue_clear", self._queue_clear),
+        ]:
+            button = QPushButton(label)
+            button.setToolTip(HELP[key])
+            button.clicked.connect(slot)
+            setattr(self, f"btn_{key}", button)
+            row.addWidget(button)
+            row.addWidget(help_button(key))
+        row.addStretch(1)
+        v.addLayout(row)
         return box
 
     def _guide_html(self) -> str:
@@ -442,6 +506,60 @@ class MainWindow(QMainWindow):
         self.log_view.setMinimumHeight(90)
         v.addWidget(self.log_view)
         return box
+
+    # --- queue --------------------------------------------------------------
+
+    def _selected_task(self) -> Task | None:
+        row = self.queue_view.currentRow()
+        if 0 <= row < len(self.queue.tasks):
+            return self.queue.tasks[row]
+        return None
+
+    def _refresh_queue(self) -> None:
+        self.queue_view.setRowCount(len(self.queue.tasks))
+        for row, task in enumerate(self.queue.tasks):
+            cells = [task.name, task.state.value, f"{task.percent}%", task.message]
+            for column, text in enumerate(cells):
+                self.queue_view.setItem(row, column, QTableWidgetItem(text))
+
+        running = self.queue.running is not None
+        self.btn_queue_start.setEnabled(not running and bool(self.queue.next_waiting()
+                                                             or self._selected_task()))
+        self.btn_queue_stop.setEnabled(running)
+        selected = self._selected_task()
+        self.btn_queue_remove.setEnabled(bool(selected and selected.can_remove))
+
+    def _queue_start(self) -> None:
+        if self.queue.running is not None:
+            return
+        task = self._selected_task()
+        if task is None or task.state is TaskState.RUNNING:
+            task = self.queue.next_waiting()
+        if task is None:
+            self._append("Nothing waiting in the queue.")
+            return
+        if task.state is not TaskState.WAITING:
+            self.queue.requeue(task)
+        self._run_task(task)
+
+    def _queue_stop(self) -> None:
+        if self.worker is not None:
+            self.worker.cancel()
+            self._append("Stopping after the current frame...")
+
+    def _queue_remove(self) -> None:
+        task = self._selected_task()
+        if task is None:
+            return
+        if not self.queue.remove(task):
+            QMessageBox.information(
+                self, "Still running",
+                "Stop this job before removing it.")
+        self._refresh_queue()
+
+    def _queue_clear(self) -> None:
+        self._append(f"Cleared {self.queue.clear_finished()} finished job(s).")
+        self._refresh_queue()
 
     def _show_model_note(self) -> None:
         name = self.model_combo.currentText()
@@ -611,6 +729,7 @@ class MainWindow(QMainWindow):
                 target_fps=target,
                 scene_threshold=self.scene_threshold.value(),
                 cpu=self.cpu.isChecked(),
+                vram_budget=self._selected_vram_budget(),
                 segment_frames=self.segment_frames.value(),
                 preview_frames=preview_frames,
             )
@@ -632,10 +751,30 @@ class MainWindow(QMainWindow):
         if not preview and request.job_dir.exists():
             self._append(f"Resuming existing job in {request.job_dir}")
 
+        # Previews jump the queue: they are short and exist to answer a
+        # question now. Full renders join the queue and run in turn.
+        if preview:
+            self._run_task(Task(request=request))
+            return
+
+        task = self.queue.add(request)
+        self._refresh_queue()
+        if self.queue.running is None:
+            self._run_task(task)
+        else:
+            self._append(f"Queued {task.name} — will start when the current job ends.")
+
+    def _run_task(self, task: Task) -> None:
+        request = task.request
+        if task in self.queue.tasks and not self.queue.start(task):
+            return
+        self.active_task = task
+        self._refresh_queue()
+
         self._set_running(True)
         self._started_at = time.perf_counter()
         self.bar.setValue(0)
-        self._append(f"{'Preview' if preview else 'Render'} -> {request.output}")
+        self._append(f"{'Preview' if request.is_preview else 'Render'} -> {request.output}")
 
         self.thread = QThread()
         self.worker = Worker(request)
@@ -689,6 +828,10 @@ class MainWindow(QMainWindow):
             self._append("Cancelling after the current frame...")
 
     def _on_progress(self, done: int, total: int) -> None:
+        if self.active_task is not None:
+            self.active_task.done_frames, self.active_task.total_frames = done, total
+            if done % 50 == 0:
+                self._refresh_queue()
         self.bar.setMaximum(total)
         self.bar.setValue(done)
         elapsed = time.perf_counter() - self._started_at
@@ -702,12 +845,33 @@ class MainWindow(QMainWindow):
     def _on_finished(self, path: str) -> None:
         self._append(f"Done: {path}")
         self.status.setText("Finished.")
+        if self.active_task is not None:
+            self.queue.finish(self.active_task)
         self._teardown()
+        self._start_next()
 
     def _on_failed(self, message: str) -> None:
         self._append(message)
         self.status.setText("Stopped.")
+        if self.active_task is not None:
+            if "Cancelled" in message or "Stopping" in message:
+                self.queue.stop(self.active_task)
+            else:
+                self.queue.fail(self.active_task, message[:80])
         self._teardown()
+        self._start_next()
+
+    def _start_next(self) -> None:
+        """Move on to the next waiting job, if any."""
+        self.active_task = None
+        self._refresh_queue()
+        following = self.queue.next_waiting()
+        if following is not None:
+            self._run_task(following)
+
+    def _selected_vram_budget(self) -> int | None:
+        megabytes = self.vram_budget.currentData()
+        return None if megabytes is None else int(megabytes) * 1024 ** 2
 
     def _teardown(self) -> None:
         if self.thread is not None:

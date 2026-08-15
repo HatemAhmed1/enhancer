@@ -12,8 +12,10 @@ REQUIRED_KEYS = [
     "source", "analysis", "model", "rescan", "no_restore",
     "degrain", "detail", "regrain", "deblock",
     "fps_mode", "fps_target", "fps_multiplier", "scene_threshold",
-    "output", "segment_frames", "cpu",
+    "output", "segment_frames", "vram_budget", "cpu",
     "preview_button", "render_button", "cancel_button", "progress",
+    "queue", "queue_start", "queue_stop", "queue_remove", "queue_clear",
+    "guide_button",
 ]
 
 
@@ -22,9 +24,36 @@ def test_every_control_has_help(key):
     assert key in HELP, f"control {key!r} has no explanation"
 
 
+# Controls where a decision has consequences, so a one-liner is not enough.
+NEEDS_DETAIL = [
+    "source", "analysis", "model", "no_restore",
+    "degrain", "detail", "regrain", "deblock",
+    "fps_mode", "fps_target", "fps_multiplier", "scene_threshold",
+    "output", "segment_frames", "vram_budget", "cpu",
+    "preview_button", "render_button", "progress",
+    "queue", "queue_stop", "queue_remove",
+]
+
+# Plain actions: complete in a line or two, and padding them would be worse.
+SIMPLE = ["rescan", "guide_button", "cancel_button", "queue_start", "queue_clear"]
+
+
 @pytest.mark.parametrize("key", REQUIRED_KEYS)
-def test_help_is_substantial(key):
-    assert len(HELP[key]) > 60, f"{key!r} explanation is too thin to be useful"
+def test_help_says_something(key):
+    assert len(HELP[key]) > 30, f"{key!r} explanation is too thin to be useful"
+
+
+@pytest.mark.parametrize("key", NEEDS_DETAIL)
+def test_consequential_controls_explain_the_trade_off(key):
+    """A plain button can be one line. A control that changes the output cannot."""
+    assert len(HELP[key]) > 90, f"{key!r} needs more than a label"
+
+
+@pytest.mark.parametrize("key", REQUIRED_KEYS)
+def test_help_opens_with_a_short_first_line(key):
+    """Lead with what it does; detail comes after."""
+    first = HELP[key].split("\n")[0]
+    assert len(first) <= 90, f"{key!r} opens with a wall of text"
 
 
 def test_no_orphan_help_entries():
@@ -85,3 +114,15 @@ def test_degrain_help_points_at_the_waxy_skin_fix():
 
 def test_detail_help_explains_it_cannot_invent_texture():
     assert "cannot" in HELP["detail"].lower()
+
+
+def test_every_key_is_classified():
+    """A new control must be judged simple or consequential, not skipped."""
+    assert set(NEEDS_DETAIL) | set(SIMPLE) == set(REQUIRED_KEYS)
+    assert not (set(NEEDS_DETAIL) & set(SIMPLE))
+
+
+@pytest.mark.parametrize("key", SIMPLE)
+def test_simple_controls_stay_brief(key):
+    """Padding a plain action out to a paragraph makes it worse, not better."""
+    assert len(HELP[key]) < 200
