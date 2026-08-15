@@ -389,6 +389,16 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gui(args: argparse.Namespace) -> int:
+    try:
+        from .window import launch
+    except ImportError:
+        print("The desktop window needs PySide6:\n"
+              "  python -m pip install PySide6")
+        return 5
+    return launch([])
+
+
 def cmd_models(args: argparse.Namespace) -> int:
     found = scan_custom_dir(Path(args.dir))
     if not found:
@@ -485,6 +495,9 @@ def main(argv: list[str] | None = None) -> int:
     a = sub.add_parser("analyze", help="inspect a source's scan type, grain, and compression")
     a.add_argument("input")
     a.set_defaults(func=cmd_analyze)
+
+    g = sub.add_parser("gui", help="open the desktop window")
+    g.set_defaults(func=cmd_gui)
 
     m = sub.add_parser("models", help="list drop-in weights")
     m.add_argument("--dir", default="models/custom")

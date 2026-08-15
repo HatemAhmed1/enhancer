@@ -1,0 +1,139 @@
+"""Offscreen tests for the Qt window.
+
+The window holds no policy, so these only check that it constructs, that
+controls map onto a RenderRequest correctly, and that guard rails fire.
+"""
+
+import os
+
+import pytest
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+pytest.importorskip("PySide6")
+
+from enhancer.window import MainWindow, PREVIEW_SECONDS  # noqa: E402
+
+
+@pytest.fixture
+def window(qtbot):
+    w = MainWindow()
+    qtbot.addWidget(w)
+    return w
+
+
+def test_window_constructs_with_a_title(window):
+    assert window.windowTitle() == "Enhancer"
+
+
+def test_starts_idle_with_cancel_disabled(window):
+    assert not window.cancel_button.isEnabled()
+    assert window.render_button.isEnabled()
+
+
+def test_defaults_match_the_engine_defaults(window):
+    assert window.degrain.value() == 25
+    assert window.detail.value() == 25
+    assert window.regrain.value() == 60
+    assert window.deblock.value() == 0
+
+
+def test_frame_rate_is_off_by_default(window):
+    assert window.fps_mode.currentText() == "Off"
+
+
+def test_render_without_a_source_is_refused(window, monkeypatch):
+    warned = []
+    monkeypatch.setattr(
+        "enhancer.window.QMessageBox.warning",
+        lambda *a, **k: warned.append(a[1]),
+    )
+    assert window._build_request(preview=False) is None
+    assert warned
+
+
+def test_request_is_built_from_the_controls(window, synthetic_clip, tmp_path):
+    window._load_source(synthetic_clip)
+    window.model_combo.clear()
+    window.model_combo.addItem("m.pth", str(tmp_path / "m.pth"))
+    window.output_label.setText(str(tmp_path / "out.mkv"))
+    window.degrain.setValue(40)
+    window.regrain.setValue(80)
+
+    req = window._build_request(preview=False)
+    assert req is not None
+    assert req.degrain == pytest.approx(0.40)
+    assert req.regrain == pytest.approx(0.80)
+    assert req.target_fps is None
+
+
+def test_preview_request_covers_the_preview_duration(window, synthetic_clip, tmp_path):
+    window._load_source(synthetic_clip)
+    window.model_combo.clear()
+    window.model_combo.addItem("m.pth", str(tmp_path / "m.pth"))
+    window.output_label.setText(str(tmp_path / "out.mkv"))
+
+    req = window._build_request(preview=True)
+    assert req.is_preview
+    assert req.preview_frames == int(25 * PREVIEW_SECONDS)
+
+
+def test_target_fps_mode_sets_the_target(window, synthetic_clip, tmp_path):
+    window._load_source(synthetic_clip)
+    window.model_combo.clear()
+    window.model_combo.addItem("m.pth", str(tmp_path / "m.pth"))
+    window.output_label.setText(str(tmp_path / "out.mkv"))
+    window.fps_mode.setCurrentText("Target FPS")
+    window.fps_target.setCurrentText("60")
+
+    assert window._build_request(preview=False).target_fps == 60.0
+
+
+def test_multiplier_mode_multiplies_the_source_rate(window, synthetic_clip, tmp_path):
+    window._load_source(synthetic_clip)
+    window.model_combo.clear()
+    window.model_combo.addItem("m.pth", str(tmp_path / "m.pth"))
+    window.output_label.setText(str(tmp_path / "out.mkv"))
+    window.fps_mode.setCurrentText("Multiplier")
+    window.fps_multiplier.setValue(2.0)
+
+    assert window._build_request(preview=False).target_fps == pytest.approx(50.0)
+
+
+def test_no_restore_checkbox_zeroes_the_sliders(window, synthetic_clip, tmp_path):
+    window._load_source(synthetic_clip)
+    window.model_combo.clear()
+    window.model_combo.addItem("m.pth", str(tmp_path / "m.pth"))
+    window.output_label.setText(str(tmp_path / "out.mkv"))
+    window.no_restore.setChecked(True)
+    window.regrain.setValue(90)
+
+    req = window._build_request(preview=False)
+    assert req.regrain == 0.0 and req.degrain == 0.0
+
+
+def test_loading_a_source_fills_in_the_analysis(window, synthetic_clip):
+    window._load_source(synthetic_clip)
+    text = window.analysis.text()
+    assert "320x240" in text
+    assert "Scan" in text
+
+
+def test_loading_a_source_proposes_an_output_path(window, synthetic_clip):
+    window._load_source(synthetic_clip)
+    assert window.output_label.text().endswith("_enhanced.mkv")
+
+
+def test_unreadable_source_reports_instead_of_raising(window, tmp_path):
+    bad = tmp_path / "not_a_video.mkv"
+    bad.write_bytes(b"garbage")
+    window._load_source(bad)
+    assert "Could not analyse" in window.analysis.text()
+
+
+def test_progress_updates_the_bar_and_status(window):
+    window._started_at = 0.0
+    window._on_progress(50, 200)
+    assert window.bar.value() == 50
+    assert window.bar.maximum() == 200
+    assert "50/200" in window.status.text()

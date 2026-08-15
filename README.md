@@ -4,12 +4,13 @@ Local GPU video and image upscaler, tuned for restoring Indian cinema footage �
 
 Runs entirely offline. No cloud services, no API keys, no telemetry.
 
-**Status:** headless engine complete and working. GUI, restoration pre-processing, and frame interpolation are planned — see [Roadmap](#roadmap).
+**Status:** working end to end — engine, restoration, frame interpolation, resumable rendering, and a desktop window. 290 tests. See [Roadmap](#roadmap) for what remains.
 
 ---
 
 ## Features
 
+- **Desktop window** — drag-and-drop, automatic source analysis, live progress, safe cancel, and a ten-second preview so a bad setting costs a minute rather than a night
 - **Frame interpolation** — any target frame rate, including non-integer ratios like 24→60, with cut detection so fast-cut footage never ghosts between shots
 - **Texture-preserving** — degrain, upscale, then restore the source's real high-frequency detail and re-grain, so skin reads as photographed rather than polished
 - **Source-aware restoration** — detects interlacing versus 3:2 telecine and applies the correct correction, since getting that wrong damages every frame irreversibly
@@ -32,6 +33,7 @@ Windows only at present.
 | OS | Windows 10/11 |
 | GPU | NVIDIA, 6 GB VRAM or more (CUDA 12.x driver) |
 | Python | 3.12 — **not** 3.13+, which has no PyTorch wheels |
+| GUI | PySide6 (optional; the CLI works without it) |
 | ffmpeg | on `PATH`, with NVENC support |
 
 Verify ffmpeg:
@@ -90,6 +92,18 @@ More models are listed in `src/enhancer/manifest.json`. Any architecture support
 ---
 
 ## Usage
+
+**Open the desktop window**
+
+```powershell
+.venv\Scripts\python.exe -m enhancer.cli gui
+```
+
+Drop a video in and it reports resolution, frame rate, colour space, scan type, grain and compression artifacts, then recommends a pre-pass. Sliders for degrain, detail retention, re-grain and deblock; frame-rate conversion; live progress with fps and ETA; cancel.
+
+**Preview before committing.** The *Preview 10s* button renders ten seconds through the identical pipeline. A 1080p→4K feature is ~17 hours, so the expensive mistake is not a slow render but a slow render with the wrong settings. Ten seconds takes under a minute and answers the same question.
+
+Cancel is safe: it stops after the current frame, keeps every completed segment, and re-running resumes.
 
 **List available models**
 
@@ -236,7 +250,8 @@ Run the test suite:
 | Resilience | Resumable renders, physical VRAM ceiling | Complete |
 | Restoration | Deinterlace/IVTC, deblock, degrain, re-grain, detail retention | Complete |
 | Interpolation | RIFE frame interpolation, scene-change detection, target FPS | Complete |
-| Interface | Desktop GUI, dual-pass 2K→4K, segment preview | Planned |
+| Interface | Desktop GUI, segment preview | Complete |
+| Comparison | Dual-pass 2K→4K, A/B compare view | Planned |
 
 ---
 
