@@ -301,6 +301,106 @@ RECIPES = [
 ]
 
 
+# A readable label for each known model: what it is for, and how quick it is.
+# Ordered by how often it is the right answer, which is the order they are
+# listed in.
+MODEL_LABELS: dict[str, tuple[str, str, int]] = {
+    # file stem: (what it is for, speed word, sort rank)
+    "2xParimgCompact": ("Video — general", "fastest", 0),
+    "2xModernSpanimationV1": ("Animation & clean video", "fast", 1),
+    "realesr-general-x4v3": ("Video — compressed sources", "fast", 2),
+    "4xPurePhoto-span": ("Photos", "medium", 3),
+    "4xNomos2_realplksr_dysample": ("Faces & close-ups", "slow", 4),
+    "RealESRGAN_x2plus": ("Photos — highest quality", "very slow", 5),
+}
+
+# Guessed from the file name when the model is not one of the above.
+CATEGORY_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("anime", "animation", "cartoon", "toon"), "Animation"),
+    (("photo", "foto"), "Photos"),
+    (("face", "portrait", "gfpgan", "codeformer"), "Faces"),
+    (("text", "manga", "comic"), "Text & line art"),
+    (("video", "film", "movie"), "Video"),
+)
+
+
+def model_scale(name: str) -> int:
+    """Scale factor read from the file name, by community convention.
+
+    Both orders are in use and both must be read, or the output size is
+    reported wrongly: "4xNomos2" writes the number first, "realesr-general-x4v3"
+    writes it second. Matching only one of them silently called a 4x model 2x.
+    """
+    import re
+
+    leading = re.search(r"(?:^|[^0-9])([248])\s*[xX]", name)
+    if leading:
+        return int(leading.group(1))
+    trailing = re.search(r"[xX]\s*([248])(?![0-9])", name)
+    return int(trailing.group(1)) if trailing else 2
+
+
+def model_category(name: str) -> str:
+    """What kind of material a model suits, from its name."""
+    stem = name.rsplit(".", 1)[0]
+    for key, (purpose, _speed, _rank) in MODEL_LABELS.items():
+        if key.lower() == stem.lower():
+            return purpose
+    lowered = stem.lower()
+    for needles, category in CATEGORY_HINTS:
+        if any(needle in lowered for needle in needles):
+            return category
+    return "General"
+
+
+def display_name(name: str, source_width: int | None = None) -> str:
+    """A label saying what a model is for, rather than what its file is called.
+
+    "2xParimgCompact.pth" says nothing useful when choosing. This gives the
+    purpose, the enlargement, and where relevant what that turns a common
+    source into.
+    """
+    stem = name.rsplit(".", 1)[0]
+    scale = model_scale(stem)
+
+    speed = ""
+    purpose = model_category(name)
+    for key, (label, speed_word, _rank) in MODEL_LABELS.items():
+        if key.lower() == stem.lower():
+            purpose, speed = label, speed_word
+            break
+
+    parts = [purpose, f"{scale}x"]
+    if source_width:
+        parts.append(f"→ {_size_name(source_width * scale)}")
+    if speed:
+        parts.append(speed)
+    return "  ·  ".join(parts)
+
+
+def _size_name(width: int) -> str:
+    """A familiar name for an output width, or the number itself."""
+    for low, high, name in (
+        (7000, 99999, "8K"),
+        (3400, 4400, "4K"),
+        (2400, 2800, "2K"),
+        (1800, 2100, "1080p"),
+        (1200, 1400, "720p"),
+    ):
+        if low <= width < high:
+            return name
+    return f"{width}px wide"
+
+
+def model_rank(name: str) -> int:
+    """Sort order: the usual answers first, the specialist ones last."""
+    stem = name.rsplit(".", 1)[0]
+    for key, (_p, _s, rank) in MODEL_LABELS.items():
+        if key.lower() == stem.lower():
+            return rank
+    return 50
+
+
 def describe_model(name: str) -> str:
     """Plain-language note for a model file name.
 

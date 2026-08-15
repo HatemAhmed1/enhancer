@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import time
 import traceback
 from pathlib import Path
@@ -40,7 +39,16 @@ from PySide6.QtWidgets import (
 from . import theme
 from .analyze import classify_scan, estimate_blockiness, estimate_grain, probe_scan
 from .gui import CancelledError, RenderJob
-from .help_text import GUIDE_SECTIONS, HELP, MODEL_NOTES, RECIPES, describe_model
+from .help_text import (
+    GUIDE_SECTIONS,
+    HELP,
+    MODEL_NOTES,
+    RECIPES,
+    describe_model,
+    display_name,
+    model_rank,
+    model_scale as scale_from_name,
+)
 from .jobs import SettingsMismatch
 from .models import scan_custom_dir
 from .queue import RenderQueue, Task, TaskState
@@ -201,17 +209,6 @@ def label_width() -> int:
     metrics = QFontMetrics(QApplication.font())
     widest = max(metrics.horizontalAdvance(text) for text in FIELD_LABELS)
     return min(widest + theme.GAP, LABEL_WIDTH_MAX)
-
-
-def scale_from_name(name: str) -> int:
-    """Guess the scale factor from a model's file name.
-
-    Community models are named by convention: 2x..., 4x... . This is only for
-    the forecast; the real value is read from the file when it loads, and the
-    two are checked against each other during the render.
-    """
-    match = re.search(r"(?:^|[^0-9])([248])\s*[xX]", name)
-    return int(match.group(1)) if match else 2
 
 
 def field_label(text: str) -> QLabel:
@@ -601,8 +598,8 @@ class MainWindow(QMainWindow):
         from .forecast import forecast
         from .images import is_image
 
-        name = self.model_combo.currentText()
         path = self.model_combo.currentData()
+        name = Path(path).name if path else self.model_combo.currentText()
         if self.source is None or not path:
             self.forecast_headline.setText("Load a source and pick a model.")
             self.forecast_detail.setText("")
@@ -775,7 +772,8 @@ class MainWindow(QMainWindow):
         self._refresh_queue()
 
     def _show_model_note(self) -> None:
-        name = self.model_combo.currentText()
+        path = self.model_combo.currentData()
+        name = Path(path).name if path else self.model_combo.currentText()
         self.model_note.setText(describe_model(name).split("\n\n")[0] if name else "")
 
     # --- behaviour ----------------------------------------------------------
@@ -791,11 +789,17 @@ class MainWindow(QMainWindow):
                 "Or drop any .pth into the models\\custom folder.",
                 Qt.ToolTipRole,
             )
-        for p in found:
-            self.model_combo.addItem(p.name, str(p))
-            # Per-entry tooltip: which kind of footage this one suits.
+        width = self.profile.width if self.profile else (
+            self._image_size[0] if self._image_size else None)
+        for p in sorted(found, key=lambda q: (model_rank(q.name), q.name)):
+            self.model_combo.addItem(display_name(p.name, width), str(p))
+            index = self.model_combo.count() - 1
+            # The file name is still what identifies it, so keep it visible in
+            # the tooltip alongside what the model actually suits.
             self.model_combo.setItemData(
-                self.model_combo.count() - 1, describe_model(p.name), Qt.ToolTipRole
+                index,
+                p.name + "\n\n" + describe_model(p.name),
+                Qt.ToolTipRole,
             )
         if hasattr(self, "model_note"):
             self._show_model_note()
