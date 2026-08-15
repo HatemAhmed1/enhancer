@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QScrollArea,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -172,7 +173,7 @@ def form(parent: QWidget) -> QFormLayout:
     layout.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
     layout.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
     layout.setHorizontalSpacing(theme.GAP)
-    layout.setVerticalSpacing(theme.GAP_TIGHT)
+    layout.setVerticalSpacing(theme.GAP)
     layout.setContentsMargins(0, 0, 0, 0)
     return layout
 
@@ -184,14 +185,21 @@ FIELD_LABELS = (
 )
 
 
+# Upper bound on the label column. Measuring alone is not enough: under a wide
+# fallback font the column grew until the two settings columns together no
+# longer fitted the window and the right one was clipped.
+LABEL_WIDTH_MAX = 150
+
+
 def label_width() -> int:
     """Width of the widest form label, measured in the font actually in use.
 
-    Hardcoding this clipped labels under a different font or at a different
-    display scaling. Measuring costs nothing and cannot be wrong.
+    Hardcoding this clipped labels under a different font or display scaling;
+    measuring without a cap pushed the layout wider than the window. Both.
     """
     metrics = QFontMetrics(QApplication.font())
-    return max(metrics.horizontalAdvance(text) for text in FIELD_LABELS) + theme.GAP
+    widest = max(metrics.horizontalAdvance(text) for text in FIELD_LABELS)
+    return min(widest + theme.GAP, LABEL_WIDTH_MAX)
 
 
 def field_label(text: str) -> QLabel:
@@ -201,6 +209,7 @@ def field_label(text: str) -> QLabel:
     label.setMinimumWidth(width)
     label.setMaximumWidth(width)
     label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+    label.setToolTip(text)
     return label
 
 
@@ -226,18 +235,20 @@ class MainWindow(QMainWindow):
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(theme.GAP)
-        left_layout.addWidget(self._source_group(), 1)
+        left_layout.setSpacing(theme.GAP_WIDE)
+        left_layout.addWidget(self._source_group())
         left_layout.addWidget(self._model_group())
         left_layout.addWidget(self._output_group())
+        left_layout.addStretch(1)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(theme.GAP)
+        right_layout.setSpacing(theme.GAP_WIDE)
         right_layout.addWidget(self._texture_group())
         right_layout.addWidget(self._fps_group())
-        right_layout.addWidget(self._queue_group(), 1)
+        right_layout.addWidget(self._queue_group())
+        right_layout.addStretch(1)
 
         self.columns = QSplitter(Qt.Horizontal)
         self.columns.addWidget(left)
@@ -246,13 +257,26 @@ class MainWindow(QMainWindow):
         self.columns.setStretchFactor(1, 2)
         self.columns.setChildrenCollapsible(False)
 
+        # Without this the settings crush into each other and overlap as soon
+        # as the window is shorter than their natural height — groups lose
+        # their padding, then their borders touch, then content spills across
+        # them. Scrolling keeps every group at its proper size instead.
+        self.scroll = QScrollArea()
+        self.scroll.setWidget(self.columns)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QScrollArea.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left.setMinimumWidth(320)
+        right.setMinimumWidth(300)
+        self.columns.setSizes([720, 520])
+
         root = QWidget()
         layout = QVBoxLayout(root)
         layout.setContentsMargins(theme.GAP_WIDE, theme.GAP_WIDE, theme.GAP_WIDE, theme.GAP_WIDE)
-        layout.setSpacing(theme.GAP)
-        layout.addWidget(self.columns, 1)
+        layout.setSpacing(theme.GAP_WIDE)
+        layout.addWidget(self.scroll, 1)
         layout.addLayout(self._actions())
-        layout.addWidget(self._progress_group())
+        layout.addWidget(self._progress_group(), 0)
         self.setCentralWidget(root)
 
         quit_action = QAction("Quit", self)
@@ -265,13 +289,13 @@ class MainWindow(QMainWindow):
     def _source_group(self) -> QGroupBox:
         box = QGroupBox("Source")
         v = QVBoxLayout(box)
-        v.setSpacing(theme.GAP_TIGHT)
+        v.setSpacing(theme.GAP)
 
         self.drop_label = QLabel("Drop a video or image here, or use Browse")
         self.drop_label.setAlignment(Qt.AlignCenter)
         self.drop_label.setWordWrap(True)
-        self.drop_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.drop_label.setMinimumHeight(70)
+        self.drop_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.drop_label.setMinimumHeight(64)
         self.drop_label.setObjectName("dropzone")
         v.addWidget(with_help(self.drop_label, "source", top=True))
 
@@ -283,9 +307,9 @@ class MainWindow(QMainWindow):
         self.analysis.setWordWrap(True)
         self.analysis.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.analysis.setAlignment(Qt.AlignTop)
-        self.analysis.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.analysis.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         self.analysis.setObjectName("analysis")
-        v.addWidget(with_help(self.analysis, "analysis", top=True), 1)
+        v.addWidget(with_help(self.analysis, "analysis", top=True))
         return box
 
     def _model_group(self) -> QGroupBox:
@@ -340,7 +364,7 @@ class MainWindow(QMainWindow):
         w = QWidget()
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(2)
+        v.setSpacing(4)
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         value = QLabel(f"{slider.value() / 100:.2f}")
@@ -356,6 +380,8 @@ class MainWindow(QMainWindow):
         note = QLabel(hint)
         note.setWordWrap(True)
         note.setObjectName("hint")
+        note.setMinimumWidth(1)
+        note.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
         v.addWidget(note)
         return w
 
@@ -442,7 +468,7 @@ class MainWindow(QMainWindow):
     def _queue_group(self) -> QGroupBox:
         box = QGroupBox("Queue")
         v = QVBoxLayout(box)
-        v.setSpacing(theme.GAP_TIGHT)
+        v.setSpacing(theme.GAP)
 
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
@@ -549,7 +575,7 @@ class MainWindow(QMainWindow):
     def _progress_group(self) -> QGroupBox:
         box = QGroupBox("Progress")
         v = QVBoxLayout(box)
-        v.setSpacing(theme.GAP_TIGHT)
+        v.setSpacing(theme.GAP)
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
         self.bar = QProgressBar()
@@ -564,8 +590,12 @@ class MainWindow(QMainWindow):
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(500)
-        self.log_view.setMinimumHeight(90)
+        self.log_view.setMinimumHeight(70)
+        # Capped, or it grows without limit and squeezes the settings out
+        # of the window when the window is short.
+        self.log_view.setMaximumHeight(110)
         v.addWidget(self.log_view)
+        box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         return box
 
     # --- queue --------------------------------------------------------------

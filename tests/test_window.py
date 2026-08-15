@@ -391,15 +391,23 @@ def test_form_labels_are_all_the_same_width(window):
     assert len(widths) == 1, "field columns would not line up"
 
 
-def test_label_column_fits_the_longest_label(window):
+def test_label_column_sizes_to_the_font_up_to_the_cap(window):
+    """Two competing failures, so the rule is the smaller of the two.
+
+    Hardcoding a width clipped labels under a wide font. Measuring without a
+    cap grew the column until the two settings columns no longer fitted the
+    window and the right one was clipped instead. A clipped label keeps its
+    full text on hover.
+    """
     from PySide6.QtGui import QFontMetrics
     from PySide6.QtWidgets import QApplication
 
-    from enhancer.window import FIELD_LABELS, label_width
+    from enhancer.window import FIELD_LABELS, LABEL_WIDTH_MAX, field_label, label_width
 
     metrics = QFontMetrics(QApplication.font())
     widest = max(metrics.horizontalAdvance(t) for t in FIELD_LABELS)
-    assert label_width() > widest, "labels would be clipped"
+    assert label_width() == min(widest + 14, LABEL_WIDTH_MAX)
+    assert field_label("Detail retention").toolTip() == "Detail retention"
 
 
 def test_render_is_the_primary_action(window):
@@ -421,3 +429,48 @@ def test_action_buttons_are_equal_width(window):
 
 def test_bring_to_front_does_not_raise(window):
     window.bring_to_front()
+
+
+# --- density and fit --------------------------------------------------------
+
+
+def test_settings_scroll_rather_than_crush(window):
+    from PySide6.QtCore import Qt
+
+    """Without scrolling, groups lose their padding, then overlap."""
+    window.resize(920, 580)
+    assert window.scroll.widgetResizable()
+    assert window.scroll.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+
+
+def test_columns_fit_inside_the_window(window):
+    """Minimum widths that together exceed the window clip the right column."""
+    for width in (1280, 1100, 960):
+        window.resize(width, 800)
+        window.show()
+        total = sum(window.columns.sizes())
+        assert total <= width, f"columns need {total}px in a {width}px window"
+
+
+def test_columns_can_compress(window):
+    left, right = window.columns.widget(0), window.columns.widget(1)
+    assert left.minimumWidth() < 400
+    assert right.minimumWidth() < 400
+
+
+def test_label_column_is_capped(window):
+    """Measuring alone let the column grow until the layout no longer fitted."""
+    from enhancer.window import LABEL_WIDTH_MAX, label_width
+
+    assert label_width() <= LABEL_WIDTH_MAX
+
+
+def test_the_log_pane_cannot_swallow_the_window(window):
+    assert window.log_view.maximumHeight() < 200
+
+
+def test_group_titles_have_clear_air_above_them(window):
+    """Titles sitting on the border above made the groups read as one block."""
+    from enhancer import theme
+
+    assert theme.GROUP_TITLE_SPACE >= theme.GAP_WIDE

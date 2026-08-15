@@ -64,11 +64,19 @@ LIGHT = Palette(
 
 # Spacing scale, in pixels. Everything in the window uses one of these, so
 # nothing drifts a pixel or two out of line with its neighbour.
-GAP_TIGHT = 6
-GAP = 10
-GAP_WIDE = 16
+#
+# Deliberately loose. A tighter scale looked fine at a large window size and
+# ran together once the window was smaller or the display scaled down, because
+# a group's title sat almost on the border of the group above it. Separation
+# between blocks has to survive being shrunk.
+GAP_TIGHT = 8
+GAP = 14
+GAP_WIDE = 24
 RADIUS = 6
-CONTROL_HEIGHT = 28
+CONTROL_HEIGHT = 30
+
+# Clear air above a group so its title never crowds the box above.
+GROUP_TITLE_SPACE = 26
 
 
 def is_dark(app) -> bool:
@@ -91,7 +99,7 @@ def stylesheet(p: Palette) -> str:
         background-color: {p.surface};
         border: 1px solid {p.border};
         border-radius: {RADIUS}px;
-        margin-top: {GAP_WIDE}px;
+        margin-top: {GROUP_TITLE_SPACE}px;
         padding: {GAP_WIDE}px {GAP}px {GAP}px {GAP}px;
         font-weight: 600;
     }}
@@ -99,12 +107,13 @@ def stylesheet(p: Palette) -> str:
         subcontrol-origin: margin;
         subcontrol-position: top left;
         left: {GAP}px;
-        padding: 0 4px;
-        color: {p.text_muted};
+        top: 2px;
+        padding: 0 6px;
+        color: {p.text_faint};
         font-size: 11px;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 0.6px;
+        letter-spacing: 0.8px;
     }}
 
     QLabel {{ background: transparent; }}
