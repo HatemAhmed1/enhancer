@@ -256,3 +256,31 @@ def test_help_button_for_an_unknown_key_does_not_crash(window):
 def test_model_note_appears_under_the_dropdown(window):
     if window.model_combo.currentData():
         assert window.model_note.text()
+
+
+def test_guide_covers_every_control(window):
+    from enhancer.help_text import HELP
+
+    html = window._guide_html()
+    for key, text in HELP.items():
+        first = text.split("\n")[0][:40]
+        assert first in html, f"guide is missing the entry for {key!r}"
+
+
+def test_guide_lists_every_catalogue_model(window):
+    from enhancer.help_text import MODEL_NOTES
+
+    html = window._guide_html()
+    for name in MODEL_NOTES:
+        assert name in html
+
+
+def test_guide_leads_with_problem_fixes(window):
+    html = window._guide_html()
+    assert "plastic" in html
+    assert "blocky" in html
+    assert "too slow" in html
+
+
+def test_guide_button_exists(window):
+    assert window.guide_button.isEnabled()

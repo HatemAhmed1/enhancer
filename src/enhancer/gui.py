@@ -57,11 +57,28 @@ class RenderJob:
             )
         return profile
 
+    def _reset_preview_state(self) -> None:
+        """Throw away any previous preview before starting a new one.
+
+        A preview exists to try settings out, so refusing to resume it when the
+        settings changed defeats the entire point — that was exactly the
+        situation the resume guard is meant to protect, and exactly the wrong
+        place to apply it. Previews are disposable; full renders are not.
+        """
+        import shutil
+
+        job_dir = self.request.job_dir
+        if job_dir and job_dir.exists():
+            shutil.rmtree(job_dir, ignore_errors=True)
+        self.request.output.unlink(missing_ok=True)
+
     def run(self, on_progress: ProgressFn | None = None) -> Path:
         from .cli import render_resumable
         from .images import is_image, upscale_image
 
         req = self.request
+        if req.is_preview:
+            self._reset_preview_state()
 
         if is_image(req.source):
             # A still has no frame rate, no segments and nothing to resume.

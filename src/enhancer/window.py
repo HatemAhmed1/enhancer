@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -27,13 +28,15 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
 from .analyze import classify_scan, estimate_blockiness, estimate_grain, probe_scan
 from .gui import CancelledError, RenderJob
-from .help_text import HELP, describe_model
+from .help_text import GUIDE_SECTIONS, HELP, MODEL_NOTES, RECIPES, describe_model
+from .jobs import SettingsMismatch
 from .models import scan_custom_dir
 from .requests import RenderRequest
 from .video_io import Decoder, SourceProfile
@@ -49,6 +52,7 @@ class Worker(QObject):
     log = Signal(str)
     finished = Signal(str)
     failed = Signal(str)
+    settings_changed = Signal()
 
     def __init__(self, request: RenderRequest) -> None:
         super().__init__()
@@ -92,6 +96,8 @@ class Worker(QObject):
             out = self.job.run(on_progress=self.progress.emit)
             self.log.emit(f"CPU fallbacks: {upscaler.cpu_fallback_count}")
             self.finished.emit(str(out))
+        except SettingsMismatch:
+            self.settings_changed.emit()
         except CancelledError:
             self.failed.emit("Cancelled. Re-run to resume from where it stopped.")
         except Exception as exc:  # noqa: BLE001 - surfaced to the user
@@ -355,8 +361,49 @@ class MainWindow(QMainWindow):
         f.addRow("", with_help(self.cpu, "cpu"))
         return box
 
+    def _guide_html(self) -> str:
+        """Every explanation in one readable page, no hovering required."""
+        parts = [
+            "<h2>Enhancer guide</h2>",
+            "<p>Every setting explained. The same text appears when you hover "
+            "a <b>?</b> in the window.</p>",
+            "<h3>If something looks wrong</h3><table cellpadding='5'>",
+        ]
+        for problem, fix in RECIPES:
+            parts.append(f"<tr><td valign='top'><b>{problem}</b></td><td>{fix}</td></tr>")
+        parts.append("</table>")
+
+        for title, entries in GUIDE_SECTIONS:
+            parts.append(f"<h3>{title}</h3>")
+            for label, key in entries:
+                body = HELP.get(key, "").replace("\n\n", "<br><br>").replace("\n", "<br>")
+                parts.append(f"<p><b>{label}</b><br>{body}</p>")
+
+        parts.append("<h3>Which model for which footage</h3>")
+        for name in sorted(MODEL_NOTES):
+            body = MODEL_NOTES[name].replace("\n\n", "<br>").replace("\n", "<br>")
+            parts.append(f"<p><b>{name}</b><br>{body}</p>")
+        return "".join(parts)
+
+    def _open_guide(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Enhancer guide")
+        dialog.resize(760, 720)
+        layout = QVBoxLayout(dialog)
+        view = QTextBrowser()
+        view.setHtml(self._guide_html())
+        layout.addWidget(view)
+        close = QPushButton("Close")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
+
     def _actions(self) -> QHBoxLayout:
         row = QHBoxLayout()
+        self.guide_button = QPushButton("Guide / Help")
+        self.guide_button.setToolTip("Open a page explaining every setting.")
+        self.guide_button.clicked.connect(self._open_guide)
+        row.addWidget(self.guide_button)
         self.preview_button = QPushButton(f"Preview {PREVIEW_SECONDS}s")
         self.preview_button.setToolTip(HELP["preview_button"])
         self.preview_button.clicked.connect(lambda: self._start(preview=True))
@@ -598,7 +645,43 @@ class MainWindow(QMainWindow):
         self.worker.log.connect(self._append)
         self.worker.finished.connect(self._on_finished)
         self.worker.failed.connect(self._on_failed)
+        self.worker.settings_changed.connect(self._on_settings_changed)
         self.thread.start()
+
+    def _on_settings_changed(self) -> None:
+        """Offer a way forward instead of a dead end.
+
+        Refusing to resume is right — splicing footage processed two different
+        ways leaves a visible seam mid-render — but the user still has to be
+        able to act on it without hunting for a folder to delete.
+        """
+        request = self.worker.request if self.worker else None
+        self._teardown()
+        if request is None:
+            return
+
+        choice = QMessageBox.question(
+            self,
+            "Settings changed",
+            "This output already has a part-finished render made with "
+            "different settings.\n\n"
+            "Continuing it would leave a visible seam partway through the "
+            "video, so it cannot simply carry on.\n\n"
+            "Start again from the beginning with your current settings?\n"
+            "(The part-finished render is discarded.)",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if choice != QMessageBox.Yes:
+            self.status.setText("Stopped — settings differ from the unfinished render.")
+            self._append("Restore the previous settings to continue it instead.")
+            return
+
+        import shutil
+
+        shutil.rmtree(request.job_dir, ignore_errors=True)
+        self._append(f"Discarded {request.job_dir}. Starting fresh.")
+        self._start(preview=request.is_preview)
 
     def _cancel(self) -> None:
         if self.worker is not None:

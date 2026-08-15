@@ -227,6 +227,74 @@ ARCH_NOTES: dict[str, str] = {
 }
 
 
+# Order and grouping used by the Guide window.
+GUIDE_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
+    ("Getting started", [
+        ("Source", "source"),
+        ("What was found in your file", "analysis"),
+        ("Model", "model"),
+        ("Rescan models", "rescan"),
+    ]),
+    ("Making skin look real, not plastic", [
+        ("Degrain", "degrain"),
+        ("Detail retention", "detail"),
+        ("Re-grain", "regrain"),
+        ("Deblock", "deblock"),
+        ("Skip all restoration", "no_restore"),
+    ]),
+    ("Smoother motion", [
+        ("Mode", "fps_mode"),
+        ("Target frame rate", "fps_target"),
+        ("Multiplier", "fps_multiplier"),
+        ("Cut sensitivity", "scene_threshold"),
+    ]),
+    ("Output and performance", [
+        ("Output file", "output"),
+        ("Segment frames", "segment_frames"),
+        ("Force CPU", "cpu"),
+    ]),
+    ("Running it", [
+        ("Preview", "preview_button"),
+        ("Render", "render_button"),
+        ("Cancel", "cancel_button"),
+        ("Progress", "progress"),
+    ]),
+]
+
+RECIPES = [
+    (
+        "Skin looks plastic or airbrushed",
+        "Lower Degrain to about 0.10, raise Detail retention to about 0.40, "
+        "and raise Re-grain to about 0.80. Degrain is almost always the cause.",
+    ),
+    (
+        "Picture looks blocky or has fuzzy edges",
+        "Raise Deblock to 0.30, or 0.50 for a very low-quality source. "
+        "Common with YouTube downloads and old rips.",
+    ),
+    (
+        "It is far too slow",
+        "Switch to 2xParimgCompact, and prefer a 2x model over a 4x one. "
+        "For a 1080p source, 2x already reaches 4K. Model choice changes speed "
+        "roughly tenfold; nothing else here comes close.",
+    ),
+    (
+        "Motion looks smeared at cuts",
+        "Lower Cut sensitivity to about 0.20 so shot changes are spotted more "
+        "readily. Common in fast-cut song sequences.",
+    ),
+    (
+        "An old DVD looks combed or striped",
+        "Nothing to do — this is detected and corrected automatically. Check "
+        "the Scan line says telecined or interlaced rather than progressive.",
+    ),
+    (
+        "Result is too grainy",
+        "Lower Re-grain to about 0.30, and raise Degrain slightly to 0.35.",
+    ),
+]
+
+
 def describe_model(name: str) -> str:
     """Plain-language note for a model file name.
 

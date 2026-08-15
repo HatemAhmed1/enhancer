@@ -110,3 +110,71 @@ def test_restoration_path_runs_end_to_end(tmp_path, synthetic_clip):
     req = _request(tmp_path, synthetic_clip, no_restore=False, preview_frames=10)
     RenderJob(req, upscaler=_Doubler()).run()
     assert req.output.exists()
+
+
+# --- preview must never refuse to run --------------------------------------
+
+
+def test_preview_reruns_after_settings_change(tmp_path, synthetic_clip):
+    """A preview exists to try settings out.
+
+    Refusing to resume it because the settings changed defeats its entire
+    purpose, which is exactly what the resume guard did before this.
+    """
+    first = _request(tmp_path, synthetic_clip, preview_frames=10, degrain=0.0,
+                     no_restore=False, detail_retention=0.1)
+    RenderJob(first, upscaler=_Doubler()).run()
+
+    second = _request(tmp_path, synthetic_clip, preview_frames=10, degrain=0.0,
+                      no_restore=False, detail_retention=0.5)
+    RenderJob(second, upscaler=_Doubler()).run()
+    assert second.output.exists()
+
+
+def test_preview_reruns_after_a_model_change(tmp_path, synthetic_clip):
+    class _Tripler(_Doubler):
+        scale = 3
+
+        def process(self, frame):
+            return np.repeat(np.repeat(frame, 3, axis=0), 3, axis=1)
+
+    req = _request(tmp_path, synthetic_clip, preview_frames=10)
+    RenderJob(req, upscaler=_Doubler()).run()
+    assert SourceProfile.probe(req.output).width == 640
+
+    req2 = _request(tmp_path, synthetic_clip, preview_frames=10)
+    RenderJob(req2, upscaler=_Tripler()).run()
+    assert SourceProfile.probe(req2.output).width == 960
+
+
+def test_preview_discards_previous_job_state(tmp_path, synthetic_clip):
+    req = _request(tmp_path, synthetic_clip, preview_frames=10, segment_frames=5)
+    RenderJob(req, upscaler=_Doubler()).run()
+    marker = req.job_dir / "stale_marker.txt"
+    marker.write_text("left over from a previous preview")
+
+    RenderJob(req, upscaler=_Doubler()).run()
+    assert not marker.exists(), "a new preview must start from a clean directory"
+
+
+def test_preview_can_be_run_many_times_in_a_row(tmp_path, synthetic_clip):
+    for detail in (0.0, 0.3, 0.6, 0.9):
+        req = _request(tmp_path, synthetic_clip, preview_frames=10,
+                       no_restore=False, detail_retention=detail)
+        RenderJob(req, upscaler=_Doubler()).run()
+        assert req.output.exists()
+
+
+def test_full_render_still_refuses_after_a_settings_change(tmp_path, synthetic_clip):
+    """The guard must stay in place where it belongs.
+
+    A real render spliced from two different settings has a visible seam.
+    """
+    from enhancer.jobs import SettingsMismatch
+
+    first = _request(tmp_path, synthetic_clip, no_restore=False, detail_retention=0.1)
+    RenderJob(first, upscaler=_Doubler()).run()
+
+    second = _request(tmp_path, synthetic_clip, no_restore=False, detail_retention=0.9)
+    with pytest.raises(SettingsMismatch):
+        RenderJob(second, upscaler=_Doubler()).run()
