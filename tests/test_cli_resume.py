@@ -216,3 +216,87 @@ def test_zero_frame_count_raises_a_clear_error(tmp_path, synthetic_clip):
             profile, DoublingUpscaler(), tmp_path / "out.mkv",
             job_dir=tmp_path / "job", segment_frames=20, settings={"scale": 2},
         )
+
+
+class _CrossFade:
+    """Linear blend standing in for RIFE."""
+
+    def __call__(self, a, b, t):
+        return (a.astype(np.float32) * (1 - t) + b.astype(np.float32) * t).astype(np.uint8)
+
+
+def test_interpolated_render_produces_the_planned_frame_count(tmp_path, synthetic_clip):
+    """50 source frames at 25 fps, doubled, is 100 output frames."""
+    profile = SourceProfile.probe(synthetic_clip)
+    out = tmp_path / "out.mkv"
+    render_resumable(
+        profile, DoublingUpscaler(), out,
+        job_dir=tmp_path / "job", segment_frames=20, settings={"scale": 2},
+        interpolate_to=50.0, flow_model=_CrossFade(),
+    )
+    assert len(list(Decoder(SourceProfile.probe(out)).frames())) == 100
+
+
+def test_interpolated_output_reports_the_target_frame_rate(tmp_path, synthetic_clip):
+    profile = SourceProfile.probe(synthetic_clip)
+    out = tmp_path / "out.mkv"
+    render_resumable(
+        profile, DoublingUpscaler(), out,
+        job_dir=tmp_path / "job", segment_frames=20, settings={"scale": 2},
+        interpolate_to=50.0, flow_model=_CrossFade(),
+    )
+    assert SourceProfile.probe(out).fps == pytest.approx(50.0, abs=0.1)
+
+
+def test_non_integer_ratio_renders_end_to_end(tmp_path, synthetic_clip):
+    """25 -> 60 fps is 2.4x, which fixed-insertion schemes cannot express."""
+    profile = SourceProfile.probe(synthetic_clip)
+    out = tmp_path / "out.mkv"
+    render_resumable(
+        profile, DoublingUpscaler(), out,
+        job_dir=tmp_path / "job", segment_frames=20, settings={"scale": 2},
+        interpolate_to=60.0, flow_model=_CrossFade(),
+    )
+    assert len(list(Decoder(SourceProfile.probe(out)).frames())) == 120
+
+
+def test_interpolated_render_still_resumes(tmp_path, synthetic_clip):
+    """Resume matters most here: interpolation is when renders get longest."""
+    profile = SourceProfile.probe(synthetic_clip)
+    job_dir = tmp_path / "job"
+
+    class FailsLate(DoublingUpscaler):
+        def __init__(self):
+            self.seen = 0
+
+        def process(self, frame):
+            self.seen += 1
+            if self.seen > 15:
+                raise RuntimeError("simulated crash")
+            return super().process(frame)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        render_resumable(
+            profile, FailsLate(), tmp_path / "crashed.mkv",
+            job_dir=job_dir, segment_frames=20, settings={"scale": 2},
+            interpolate_to=50.0, flow_model=_CrossFade(),
+        )
+    assert segment_path(job_dir, 0).exists()
+
+    out = tmp_path / "out.mkv"
+    render_resumable(
+        profile, DoublingUpscaler(), out,
+        job_dir=job_dir, segment_frames=20, settings={"scale": 2},
+        interpolate_to=50.0, flow_model=_CrossFade(),
+    )
+    assert len(list(Decoder(SourceProfile.probe(out)).frames())) == 100
+
+
+def test_interpolation_without_a_flow_model_is_rejected(tmp_path, synthetic_clip):
+    profile = SourceProfile.probe(synthetic_clip)
+    with pytest.raises(ValueError, match="flow_model"):
+        render_resumable(
+            profile, DoublingUpscaler(), tmp_path / "out.mkv",
+            job_dir=tmp_path / "job", segment_frames=20, settings={"scale": 2},
+            interpolate_to=50.0,
+        )

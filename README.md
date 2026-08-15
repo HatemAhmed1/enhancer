@@ -10,6 +10,7 @@ Runs entirely offline. No cloud services, no API keys, no telemetry.
 
 ## Features
 
+- **Frame interpolation** — any target frame rate, including non-integer ratios like 24→60, with cut detection so fast-cut footage never ghosts between shots
 - **Texture-preserving** — degrain, upscale, then restore the source's real high-frequency detail and re-grain, so skin reads as photographed rather than polished
 - **Source-aware restoration** — detects interlacing versus 3:2 telecine and applies the correct correction, since getting that wrong damages every frame irreversibly
 - **Resumable** — renders are written as independently complete segments, so an interruption costs at most one segment, not the whole job
@@ -130,6 +131,23 @@ Restoration is on by default. Scan correction is chosen automatically from the d
 
 Restoration costs roughly 35% throughput. Use `--no-restore` for a fast preview, then render properly.
 
+**Increase the frame rate**
+
+```powershell
+.venv\Scripts\python.exe -m enhancer.cli video models\custom\2xParimgCompact.pth input.mp4 output.mkv --fps 60
+```
+
+`--fps` sets an absolute target; `--interpolate 2` sets a multiplier instead. Non-integer ratios work — 24→60 is 2.5x, synthesized at fractional timesteps rather than by inserting whole frames.
+
+Cut detection is always on. Interpolating across a hard cut produces a ghost-morph between two unrelated shots, which in cut-heavy choreography would be visible many times per song. At a cut the nearest real frame is duplicated instead. Tune with `--scene-threshold` (0–1, lower detects more cuts).
+
+Requires RIFE weights in `models\rife\`:
+
+```powershell
+mkdir models\rife
+curl.exe -L -o models\rife\flownet.pkl https://github.com/HolyWu/vs-rife/releases/download/model/flownet_v4.25.pkl
+```
+
 **Resume an interrupted render**
 
 Re-run the identical command. Completed segments are skipped and the render picks up where it stopped.
@@ -217,7 +235,7 @@ Run the test suite:
 | Core engine | Tiling, OOM safety, streaming I/O, model loading, benchmarking, YouTube | Complete |
 | Resilience | Resumable renders, physical VRAM ceiling | Complete |
 | Restoration | Deinterlace/IVTC, deblock, degrain, re-grain, detail retention | Complete |
-| Interpolation | RIFE frame interpolation, scene-change detection, target FPS | Planned |
+| Interpolation | RIFE frame interpolation, scene-change detection, target FPS | Complete |
 | Interface | Desktop GUI, dual-pass 2K→4K, segment preview | Planned |
 
 ---

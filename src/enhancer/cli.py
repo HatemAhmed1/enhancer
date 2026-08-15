@@ -8,15 +8,18 @@ import sys
 from pathlib import Path
 
 from .bench import benchmark
+from .interpolate import render_from_plan
 from .jobs import JobState, SettingsMismatch
 from .models import load_model, scan_custom_dir
 from .segments import assemble, segment_path, write_segment
+from .timing import plan_output_frames
 from .upscale import Upscaler
 from .video_io import Decoder, SourceProfile
 from .vram import choose_tile, free_vram_bytes, select_device
 
 DEFAULT_BYTES_PER_OUTPUT_PIXEL = 64
 DEFAULT_SEGMENT_FRAMES = 500
+DEFAULT_SCENE_THRESHOLD = 0.30
 
 
 def _auto_tile(scale: int, overlap: int) -> int:
@@ -48,6 +51,9 @@ def render_resumable(
     on_progress=None,
     video_filter: str = "",
     texture=None,
+    interpolate_to: float | None = None,
+    flow_model=None,
+    scene_threshold: float | None = None,
 ) -> Path:
     """Render `profile` to `output`, resuming any interrupted prior attempt.
 
@@ -80,12 +86,26 @@ def render_resumable(
     if "decimate" in video_filter:
         segment_frames = profile.frame_count
 
+    # Unlike inverse telecine, interpolation's output length is fully determined
+    # in advance, so segments can be sized in OUTPUT frames and mapped back to
+    # the source frames each one needs. Resume therefore survives interpolation,
+    # which matters because interpolation is when renders get longest.
+    plan = None
+    out_fps = profile.fps
+    total_frames = profile.frame_count
+    if interpolate_to is not None:
+        if flow_model is None:
+            raise ValueError("interpolate_to was given without a flow_model")
+        plan = plan_output_frames(profile.fps, interpolate_to, profile.frame_count)
+        total_frames = len(plan)
+        out_fps = interpolate_to
+
     if (job_dir / "job.json").exists():
         job = JobState.load(job_dir, settings=settings)
     else:
         job = JobState.create(
             job_dir, source=str(profile.path), settings=settings,
-            total_frames=profile.frame_count, segment_frames=segment_frames,
+            total_frames=total_frames, segment_frames=segment_frames,
         )
 
     out_w = profile.width * scale
@@ -97,22 +117,48 @@ def render_resumable(
 
         start = job.start_frame_for(index)
         count = job.frames_in_segment(index)
+
+        if plan is None:
+            src_start, src_count = start, count
+            segment_plan = None
+        else:
+            # Decode exactly the source frames this output segment brackets.
+            segment_plan = plan[start:start + count]
+            src_start = min(f.left for f in segment_plan)
+            src_count = max(f.right for f in segment_plan) - src_start + 1
+
         decoder = Decoder(
-            profile, start_frame=start, max_frames=count, video_filter=video_filter,
+            profile, start_frame=src_start, max_frames=src_count,
+            video_filter=video_filter,
         )
 
-        def processed(decoder=decoder, start=start):
+        def upscaled_frames(decoder=decoder, src_start=src_start):
             for i, frame in enumerate(decoder.frames()):
-                upscaled = upscaler.process(frame)
+                out = upscaler.process(frame)
                 if texture is not None and texture.enabled:
-                    upscaled = texture.apply(upscaled, frame, index=start + i)
-                yield upscaled
+                    out = texture.apply(out, frame, index=src_start + i)
+                yield out
+
+        def processed(
+            decoder=decoder, start=start, src_start=src_start, segment_plan=segment_plan
+        ):
+            if segment_plan is None:
+                frames = upscaled_frames(decoder, src_start)
+            else:
+                # Upscale first, then interpolate: RIFE blends already-detailed
+                # frames, and the upscaler never runs on synthesized content.
+                frames = render_from_plan(
+                    upscaled_frames(decoder, src_start), src_start,
+                    segment_plan, flow_model, scene_threshold,
+                )
+            for i, frame in enumerate(frames):
+                yield frame
                 if on_progress:
                     on_progress(start + i + 1, job.total_frames)
 
         write_segment(
             segment_path(job_dir, index), processed(),
-            width=out_w, height=out_h, fps=profile.fps, source=profile,
+            width=out_w, height=out_h, fps=out_fps, source=profile,
         )
         job.mark_complete(index)
 
@@ -153,6 +199,35 @@ def cmd_video(args: argparse.Namespace) -> int:
         device=str(device),
     )
 
+    if args.fps is not None and args.interpolate is not None:
+        print("Use either --fps or --interpolate, not both.")
+        return 3
+
+    target_fps = None
+    flow_model = None
+    if args.fps is not None:
+        target_fps = float(args.fps)
+    elif args.interpolate is not None:
+        from .interpolate import Interpolator
+
+        target_fps = Interpolator.target_fps(profile.fps, float(args.interpolate))
+
+    if target_fps is not None:
+        if target_fps < profile.fps:
+            print(f"Target rate {target_fps} is below the source rate "
+                  f"{profile.fps:.3f}; this tool interpolates but does not decimate.")
+            return 3
+        # Loaded only when interpolation is requested, so a missing RIFE weight
+        # file never blocks a plain upscale.
+        from .rife import RIFE_DIR, load_rife
+
+        weights = sorted(RIFE_DIR.glob("*.pkl")) + sorted(RIFE_DIR.glob("*.pth"))
+        if not weights:
+            print(f"Frame interpolation needs RIFE weights in {RIFE_DIR}. "
+                  f"See the setup guide.")
+            return 4
+        flow_model = load_rife(weights[0], device=device)
+
     # Every restoration setting that can change the pixels goes into the job
     # hash, including the derived filter string itself: changing any of these
     # between runs against the same job directory must refuse to resume
@@ -171,6 +246,8 @@ def cmd_video(args: argparse.Namespace) -> int:
         "scan": scan.value,
         "field_order": field_order,
         "video_filter": video_filter,
+        "target_fps": target_fps,
+        "scene_threshold": args.scene_threshold,
     }
     job_dir = Path(args.job_dir) if args.job_dir else Path(args.output).with_suffix(".job")
 
@@ -180,16 +257,24 @@ def cmd_video(args: argparse.Namespace) -> int:
     if "decimate" in video_filter:
         print("Inverse telecine detected: this source will render as a single "
               "segment, with resume disabled for this job.")
+    if target_fps is not None:
+        print(f"Interpolating {profile.fps:.3f} -> {target_fps:.3f} fps")
 
     def progress(done: int, total: int) -> None:
         if done % 50 == 0:
             print(f"\r{done}/{total}", end="", flush=True)
+
+    scene_threshold = (
+        DEFAULT_SCENE_THRESHOLD if args.scene_threshold is None else args.scene_threshold
+    )
 
     try:
         render_resumable(
             profile, up, args.output, job_dir=job_dir,
             segment_frames=args.segment_frames, settings=settings,
             on_progress=progress, video_filter=video_filter, texture=texture,
+            interpolate_to=target_fps, flow_model=flow_model,
+            scene_threshold=scene_threshold,
         )
     except SettingsMismatch as exc:
         print(f"\nCannot resume: {exc}")
@@ -314,6 +399,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="blend of real source high-frequency detail into the output, 0.0-1.0")
     v.add_argument("--regrain", type=float, default=0.6,
                     help="synthetic film grain added after upscaling, 0.0-1.0")
+    v.add_argument("--fps", type=float, default=None,
+                    help="target output frame rate, e.g. 60")
+    v.add_argument("--interpolate", type=float, default=None,
+                    help="frame rate multiplier, e.g. 2 (alternative to --fps)")
+    v.add_argument("--scene-threshold", type=float, default=None,
+                    help="cut sensitivity 0-1; lower detects more cuts")
     v.add_argument("--no-restore", action="store_true",
                     help="skip all restoration and texture work")
     v.set_defaults(func=cmd_video)

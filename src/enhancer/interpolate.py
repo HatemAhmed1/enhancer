@@ -7,7 +7,7 @@ from collections.abc import Iterable, Iterator
 import numpy as np
 
 from .scenes import DEFAULT_THRESHOLD, is_scene_change
-from .timing import plan_output_frames
+from .timing import OutputFrame, plan_output_frames
 
 
 class Interpolator:
@@ -47,6 +47,25 @@ def interpolate_stream(
         return
 
     plan = plan_output_frames(src_fps, dst_fps, len(source))
+    yield from render_from_plan(source, 0, plan, model, scene_threshold)
+
+
+def render_from_plan(
+    frames: Iterable[np.ndarray],
+    first_index: int,
+    plan: Iterable[OutputFrame],
+    model,
+    scene_threshold: float | None = DEFAULT_THRESHOLD,
+) -> Iterator[np.ndarray]:
+    """Produce output frames for a pre-computed plan.
+
+    `frames[i]` holds source frame `first_index + i`. The segmented renderer
+    plans the whole job once and slices it per segment, so timesteps stay
+    globally consistent no matter where a segment boundary falls — planning each
+    segment independently would restart the phase and produce visible stutter at
+    every boundary.
+    """
+    source = list(frames)
 
     # Cut detection is per source pair, not per output frame: the same pair
     # backs several output frames at high ratios, and the answer cannot change
@@ -54,20 +73,23 @@ def interpolate_stream(
     cuts: dict[tuple[int, int], bool] = {}
 
     for entry in plan:
-        if entry.is_copy or entry.left == entry.right:
-            yield source[entry.left]
+        left = entry.left - first_index
+        right = entry.right - first_index
+
+        if entry.is_copy or left == right:
+            yield source[left]
             continue
 
-        key = (entry.left, entry.right)
+        key = (left, right)
         if key not in cuts:
             cuts[key] = (
                 scene_threshold is not None
-                and is_scene_change(source[entry.left], source[entry.right], scene_threshold)
+                and is_scene_change(source[left], source[right], scene_threshold)
             )
 
         if cuts[key]:
             # Duplicate the nearer real frame rather than morphing between shots.
             # An exact midpoint has no nearer side, so it favours the earlier frame.
-            yield source[entry.left if entry.t <= 0.5 else entry.right]
+            yield source[left if entry.t <= 0.5 else right]
         else:
-            yield model(source[entry.left], source[entry.right], entry.t)
+            yield model(source[left], source[right], entry.t)
