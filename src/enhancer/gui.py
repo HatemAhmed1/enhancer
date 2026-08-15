@@ -59,8 +59,22 @@ class RenderJob:
 
     def run(self, on_progress: ProgressFn | None = None) -> Path:
         from .cli import render_resumable
+        from .images import is_image, upscale_image
 
         req = self.request
+
+        if is_image(req.source):
+            # A still has no frame rate, no segments and nothing to resume.
+            texture = TexturePost(
+                detail_retention=req.detail_retention,
+                regrain=req.regrain,
+                device=str(getattr(self._upscaler, "device", "cpu")),
+            )
+            out = upscale_image(req.source, req.output, self._upscaler, texture=texture)
+            if on_progress:
+                on_progress(1, 1)
+            return out
+
         profile = self._profile()
         req.validate_against(profile.fps)
 

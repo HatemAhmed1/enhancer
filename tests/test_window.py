@@ -137,3 +137,50 @@ def test_progress_updates_the_bar_and_status(window):
     assert window.bar.value() == 50
     assert window.bar.maximum() == 200
     assert "50/200" in window.status.text()
+
+
+# --- still images -----------------------------------------------------------
+
+
+@pytest.fixture
+def png(tmp_path):
+    import numpy as np
+    from PIL import Image
+
+    p = tmp_path / "still.png"
+    Image.fromarray(np.full((40, 60, 3), 128, dtype=np.uint8)).save(p)
+    return p
+
+
+def test_loading_an_image_reports_it_as_a_still(window, png):
+    window._load_source(png)
+    assert "Still image" in window.analysis.text()
+    assert "60x40" in window.analysis.text()
+
+
+def test_loading_an_image_disables_frame_rate_conversion(window, png):
+    window._load_source(png)
+    assert not window.fps_mode.isEnabled()
+    assert not window.preview_button.isEnabled()
+
+
+def test_loading_a_video_after_an_image_re_enables_the_controls(window, png, synthetic_clip):
+    window._load_source(png)
+    window._load_source(synthetic_clip)
+    assert window.fps_mode.isEnabled()
+    assert window.preview_button.isEnabled()
+
+
+def test_image_output_keeps_the_source_extension(window, png):
+    window._load_source(png)
+    assert window.output_label.text().endswith("_enhanced.png")
+
+
+def test_image_request_has_no_target_fps_or_preview(window, png, tmp_path):
+    window._load_source(png)
+    window.model_combo.clear()
+    window.model_combo.addItem("m.pth", str(tmp_path / "m.pth"))
+    req = window._build_request(preview=False)
+    assert req is not None
+    assert req.target_fps is None
+    assert req.preview_frames is None

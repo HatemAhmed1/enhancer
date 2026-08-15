@@ -319,10 +319,21 @@ class MainWindow(QMainWindow):
             self.output_label.setText(name)
 
     def _load_source(self, path: Path) -> None:
+        from .images import is_image
+
         self.source = path
         self.drop_label.setText(path.name)
         self.analysis.setText("Analysing...")
         QApplication.processEvents()
+
+        if is_image(path):
+            self._load_image_source(path)
+            return
+
+        # Re-enable controls a previously loaded still may have switched off.
+        self.fps_mode.setEnabled(True)
+        self.preview_button.setEnabled(True)
+
         try:
             self.profile = SourceProfile.probe(path)
             analysis = probe_scan(path)
@@ -353,25 +364,55 @@ class MainWindow(QMainWindow):
         if self.output_label.text().startswith("("):
             self.output_label.setText(str(path.with_name(path.stem + "_enhanced.mkv")))
 
+    def _load_image_source(self, path: Path) -> None:
+        """Stills take a different path: no frame rate, no scan type, no resume."""
+        from .images import estimate_still_grain, load_image
+
+        self.profile = None
+        try:
+            rgb, alpha = load_image(path)
+        except Exception as exc:  # noqa: BLE001 - shown to the user
+            self.analysis.setText(f"Could not read this image: {exc}")
+            return
+
+        grain, blockiness = estimate_still_grain(rgb)
+        h, w = rgb.shape[:2]
+        lines = [
+            f"Still image, {w}x{h}{', with alpha' if alpha is not None else ''}",
+            f"Grain {grain:.2f}, blockiness {blockiness:.2f}",
+        ]
+        if blockiness > 2.0:
+            lines.append("Compression artifacts present.")
+        lines.append("Frame rate conversion and preview do not apply to a still.")
+        self.analysis.setText("\n".join(lines))
+
+        self.fps_mode.setCurrentText("Off")
+        self.fps_mode.setEnabled(False)
+        self.preview_button.setEnabled(False)
+
+        if self.output_label.text().startswith("("):
+            self.output_label.setText(str(path.with_name(path.stem + "_enhanced" + path.suffix)))
+
     def _build_request(self, preview: bool) -> RenderRequest | None:
         model = self.model_combo.currentData()
         if not model:
             QMessageBox.warning(self, "No model", "Put a .pth into models/custom first.")
             return None
-        if self.source is None or self.profile is None:
-            QMessageBox.warning(self, "No source", "Load a video first.")
+        if self.source is None:
+            QMessageBox.warning(self, "No source", "Load a video or image first.")
             return None
 
+        # A still has no frame rate, so neither interpolation nor preview apply.
         target = None
-        mode = self.fps_mode.currentText()
-        if mode == "Target FPS":
-            target = float(self.fps_target.currentText())
-        elif mode == "Multiplier":
-            target = self.profile.fps * self.fps_multiplier.value()
-
-        preview_frames = (
-            int(self.profile.fps * PREVIEW_SECONDS) if preview else None
-        )
+        preview_frames = None
+        if self.profile is not None:
+            mode = self.fps_mode.currentText()
+            if mode == "Target FPS":
+                target = float(self.fps_target.currentText())
+            elif mode == "Multiplier":
+                target = self.profile.fps * self.fps_multiplier.value()
+            if preview:
+                preview_frames = int(self.profile.fps * PREVIEW_SECONDS)
 
         try:
             return RenderRequest(
@@ -397,11 +438,12 @@ class MainWindow(QMainWindow):
         request = self._build_request(preview)
         if request is None:
             return
-        try:
-            request.validate_against(self.profile.fps)
-        except ValueError as exc:
-            QMessageBox.warning(self, "Invalid settings", str(exc))
-            return
+        if self.profile is not None:
+            try:
+                request.validate_against(self.profile.fps)
+            except ValueError as exc:
+                QMessageBox.warning(self, "Invalid settings", str(exc))
+                return
 
         if not preview and request.job_dir.exists():
             self._append(f"Resuming existing job in {request.job_dir}")

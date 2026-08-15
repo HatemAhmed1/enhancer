@@ -4,7 +4,7 @@ Local GPU video and image upscaler, tuned for restoring Indian cinema footage �
 
 Runs entirely offline. No cloud services, no API keys, no telemetry.
 
-**Status:** working end to end — engine, restoration, frame interpolation, resumable rendering, and a desktop window. 290 tests. See [Roadmap](#roadmap) for what remains.
+**Status:** working end to end — engine, restoration, frame interpolation, resumable rendering, and a desktop window. 315 tests. See [Roadmap](#roadmap) for what remains.
 
 ---
 
@@ -20,6 +20,7 @@ Runs entirely offline. No cloud services, no API keys, no telemetry.
 - **Any model** — drop any [OpenModelDB](https://openmodeldb.info/) `.pth` into `models/custom/` and it appears automatically; architecture is auto-detected
 - **Colour-correct** — BT.601/709 primaries, transfer, matrix, and sample aspect ratio are preserved end to end
 - **10-bit NVENC output** with audio, subtitle, and chapter passthrough
+- **Images and video** — `.png`, `.jpg`, `.webp` stills alongside `.mp4`, `.mkv`, `.mov`, with alpha preserved
 - **YouTube source** — search and download directly, no API key required
 
 ---
@@ -126,6 +127,14 @@ Reports frames per second, peak VRAM, selected tile size, and an estimated time 
 ```
 
 Reports resolution, colour space, sample aspect ratio, scan type, grain level and compression blockiness, then recommends a pre-pass. Worth running on anything from a disc rip — a film-sourced 30i DVD needs inverse telecine, not deinterlacing, and choosing wrong softens every frame permanently.
+
+**Upscale an image**
+
+```powershell
+.venv\Scripts\python.exe -m enhancer.cli video models\customxParimgCompact.pth photo.jpg photo_4k.jpg
+```
+
+Stills take a separate path: no frame rate, no segments, no resume. The output format follows the extension you give it, and PNG alpha is preserved.
 
 **Upscale a video**
 

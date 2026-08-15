@@ -251,9 +251,42 @@ def resolve_target_fps(
     return target, None
 
 
+def _run_image(args: argparse.Namespace) -> int:
+    """Upscale a still. Images have no frame rate, segments or audio."""
+    from .images import upscale_image
+    from .restore import RestoreSettings, TexturePost
+
+    device = select_device(prefer_cuda=not args.cpu)
+    model = load_model(Path(args.model), device=device, half=not args.cpu)
+    tile = args.tile or _auto_tile(model.scale, args.overlap)
+    up = Upscaler(model, tile=tile, overlap=args.overlap, device=device, half=not args.cpu)
+
+    settings = RestoreSettings(
+        deblock=0.0, degrain=0.0,
+        detail_retention=0.0 if args.no_restore else args.detail_retention,
+        regrain=0.0 if args.no_restore else args.regrain,
+    )
+    texture = TexturePost(
+        detail_retention=settings.detail_retention,
+        regrain=settings.regrain,
+        device=str(device),
+    )
+
+    out = upscale_image(args.input, args.output, up, texture=texture)
+    print(f"{out}  ({model.scale}x, tile={tile}, CPU fallbacks: {up.cpu_fallback_count})")
+    return 0
+
+
 def cmd_video(args: argparse.Namespace) -> int:
     from .analyze import ScanType, classify_scan, probe_scan
+    from .images import is_image
     from .restore import RestoreSettings, TexturePost, build_filter_chain
+
+    if is_image(args.input):
+        if args.fps is not None or args.interpolate is not None:
+            print("Frame rate conversion does not apply to a still image.")
+            return 3
+        return _run_image(args)
 
     profile = SourceProfile.probe(args.input)
 
@@ -399,14 +432,52 @@ def cmd_gui(args: argparse.Namespace) -> int:
     return launch([])
 
 
+def _registry(cache_dir: Path) -> "ModelRegistry":
+    from .models import ModelRegistry
+
+    manifest = Path(__file__).resolve().parent / "manifest.json"
+    return ModelRegistry(manifest_path=manifest, cache_dir=cache_dir)
+
+
 def cmd_models(args: argparse.Namespace) -> int:
-    found = scan_custom_dir(Path(args.dir))
-    if not found:
-        print(f"No weights found in {args.dir}")
-        return 1
-    for p in found:
-        print(f"  {p.name}  ({p.stat().st_size / 1024 ** 2:.0f} MB)")
-    return 0
+    """List drop-in weights and the curated, hash-verified catalogue."""
+    cache = Path(args.dir)
+
+    if args.get:
+        reg = _registry(cache)
+        try:
+            entry = reg.get(args.get)
+        except KeyError:
+            print(f"Unknown model id: {args.get!r}. Run 'models' to see the catalogue.")
+            return 1
+
+        def progress(done: int, total: int) -> None:
+            if total:
+                print(f"\r{entry.id}: {done * 100 // total}%", end="", flush=True)
+
+        print(f"Downloading {entry.id} ({entry.size / 1024 ** 2:.0f} MB) from {entry.url}")
+        path = reg.ensure(entry, on_progress=progress)
+        print(f"\nVerified and saved to {path}")
+        return 0
+
+    found = scan_custom_dir(cache)
+    print(f"Installed in {cache}:")
+    if found:
+        for p in found:
+            print(f"  {p.name}  ({p.stat().st_size / 1024 ** 2:.0f} MB)")
+    else:
+        print("  (none)")
+
+    print("\nCatalogue (download with: models --get ID):")
+    for entry in _registry(cache).list():
+        present = "installed" if reg_installed(cache, entry) else "not installed"
+        print(f"  {entry.id:34s} {entry.tier:9s} {entry.scale}x  {entry.arch:12s} {present}")
+    return 0 if found else 1
+
+
+def reg_installed(cache: Path, entry) -> bool:
+    """True when a catalogue model is already present under `cache`."""
+    return (cache / f"{entry.id}.pth").exists() or (cache / f"{entry.id}.pkl").exists()
 
 
 def cmd_search(args: argparse.Namespace) -> int:
@@ -499,8 +570,10 @@ def main(argv: list[str] | None = None) -> int:
     g = sub.add_parser("gui", help="open the desktop window")
     g.set_defaults(func=cmd_gui)
 
-    m = sub.add_parser("models", help="list drop-in weights")
+    m = sub.add_parser("models", help="list installed and downloadable weights")
     m.add_argument("--dir", default="models/custom")
+    m.add_argument("--get", default=None, metavar="ID",
+                    help="download a catalogue model and verify its SHA-256")
     m.set_defaults(func=cmd_models)
 
     s = sub.add_parser("search", help="search YouTube")

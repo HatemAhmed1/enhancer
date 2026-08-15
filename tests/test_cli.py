@@ -92,14 +92,14 @@ def test_missing_subcommand_exits_nonzero():
 
 
 def test_models_command_reports_an_empty_directory(tmp_path, capsys):
-    args = type("A", (), {"dir": str(tmp_path / "absent")})()
+    args = type("A", (), {"dir": str(tmp_path / "absent"), "get": None})()
     assert cli.cmd_models(args) == 1
-    assert "No weights found" in capsys.readouterr().out
+    assert "(none)" in capsys.readouterr().out
 
 
 def test_models_command_lists_what_it_finds(tmp_path, capsys):
     (tmp_path / "a_model.pth").write_bytes(b"x" * 2048)
-    args = type("A", (), {"dir": str(tmp_path)})()
+    args = type("A", (), {"dir": str(tmp_path), "get": None})()
     assert cli.cmd_models(args) == 0
     assert "a_model.pth" in capsys.readouterr().out
 
@@ -136,3 +136,46 @@ def test_rife_dir_is_absolute():
     from enhancer.rife import RIFE_DIR
 
     assert RIFE_DIR.is_absolute() or RIFE_DIR.is_dir()
+
+
+# --- model catalogue --------------------------------------------------------
+
+
+def _models_args(tmp_path, get=None):
+    return type("A", (), {"dir": str(tmp_path), "get": get})()
+
+
+def test_models_lists_the_catalogue_alongside_installed(tmp_path, capsys):
+    cli.cmd_models(_models_args(tmp_path))
+    out = capsys.readouterr().out
+    assert "Catalogue" in out
+    assert "realesr-general-x4v3" in out, "the shipped manifest must be reachable"
+
+
+def test_catalogue_marks_absent_models_as_not_installed(tmp_path, capsys):
+    cli.cmd_models(_models_args(tmp_path))
+    assert "not installed" in capsys.readouterr().out
+
+
+def test_catalogue_marks_present_models_as_installed(tmp_path, capsys):
+    (tmp_path / "realesr-general-x4v3.pth").write_bytes(b"x")
+    cli.cmd_models(_models_args(tmp_path))
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if "realesr-general-x4v3" in ln and "4x" in ln)
+    assert line.rstrip().endswith("installed")
+    assert "not installed" not in line
+
+
+def test_unknown_catalogue_id_is_rejected(tmp_path, capsys):
+    assert cli.cmd_models(_models_args(tmp_path, get="no-such-model")) == 1
+    assert "Unknown model id" in capsys.readouterr().out
+
+
+def test_every_catalogue_entry_has_a_real_digest(tmp_path):
+    """The project rule: no invented hashes ever ship."""
+    import re
+
+    for entry in cli._registry(tmp_path).list():
+        assert re.fullmatch(r"[0-9a-f]{64}", entry.sha256)
+        assert entry.url.startswith("https://")
+        assert entry.size > 0
