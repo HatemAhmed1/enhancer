@@ -81,14 +81,19 @@ Expected: `True NVIDIA GeForce RTX 3060 Laptop GPU` (or your card). If this prin
 
 **6. Add a model**
 
-Create `models\custom\` and download at least one upscaling model into it:
+See what is available, then download one. Every catalogue entry is verified against a SHA-256 recorded from a real download:
 
 ```powershell
-mkdir models\custom
-curl.exe -L -o models\custom\realesr-general-x4v3.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth
+.venv\Scripts\python.exe -m enhancer.cli models
 ```
 
-More models are listed in `src/enhancer/manifest.json`. Any architecture supported by [spandrel](https://github.com/chaiNNer-org/spandrel) will load.
+```powershell
+.venv\Scripts\python.exe -m enhancer.cli models --get 2xParimgCompact
+```
+
+Good starting points: `2xParimgCompact` (fastest), `2xModernSpanimationV1` (balanced), `RealESRGAN_x2plus` (slowest, stills only).
+
+You can also drop any [OpenModelDB](https://openmodeldb.info/) `.pth` straight into `models\custom\` — anything [spandrel](https://github.com/chaiNNer-org/spandrel) supports loads with no configuration.
 
 ---
 
@@ -131,7 +136,7 @@ Reports resolution, colour space, sample aspect ratio, scan type, grain level an
 **Upscale an image**
 
 ```powershell
-.venv\Scripts\python.exe -m enhancer.cli video models\customxParimgCompact.pth photo.jpg photo_4k.jpg
+.venv\Scripts\python.exe -m enhancer.cli video models\custom\2xParimgCompact.pth photo.jpg photo_4k.jpg
 ```
 
 Stills take a separate path: no frame rate, no segments, no resume. The output format follows the extension you give it, and PNG alpha is preserved.
