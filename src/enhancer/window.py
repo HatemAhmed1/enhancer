@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 import traceback
 from pathlib import Path
@@ -202,6 +203,17 @@ def label_width() -> int:
     return min(widest + theme.GAP, LABEL_WIDTH_MAX)
 
 
+def scale_from_name(name: str) -> int:
+    """Guess the scale factor from a model's file name.
+
+    Community models are named by convention: 2x..., 4x... . This is only for
+    the forecast; the real value is read from the file when it loads, and the
+    two are checked against each other during the render.
+    """
+    match = re.search(r"(?:^|[^0-9])([248])\s*[xX]", name)
+    return int(match.group(1)) if match else 2
+
+
 def field_label(text: str) -> QLabel:
     """A form label of uniform width, so every field column lines up."""
     label = QLabel(text)
@@ -228,6 +240,8 @@ class MainWindow(QMainWindow):
         self._started_at = 0.0
         self.queue = RenderQueue()
         self.active_task: Task | None = None
+        self._scan_type = "progressive"
+        self._image_size: tuple[int, int] | None = None
 
         # Landscape: settings in two columns side by side, progress spanning the
         # full width beneath. The splitter lets the columns be rebalanced, and
@@ -275,9 +289,13 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(theme.GAP_WIDE, theme.GAP_WIDE, theme.GAP_WIDE, theme.GAP_WIDE)
         layout.setSpacing(theme.GAP_WIDE)
         layout.addWidget(self.scroll, 1)
+        layout.addWidget(self._forecast_group())
         layout.addLayout(self._actions())
         layout.addWidget(self._progress_group(), 0)
         self.setCentralWidget(root)
+
+        self._watch_settings()
+        self._update_forecast()
 
         quit_action = QAction("Quit", self)
         quit_action.setShortcut("Ctrl+Q")
@@ -541,6 +559,110 @@ class MainWindow(QMainWindow):
         layout.addWidget(close)
         dialog.exec()
 
+    def _forecast_group(self) -> QGroupBox:
+        box = QGroupBox("You will get")
+        v = QVBoxLayout(box)
+        v.setSpacing(theme.GAP_TIGHT)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        self.forecast_headline = QLabel("Load a source to see what will be produced.")
+        self.forecast_headline.setObjectName("headline")
+        self.forecast_headline.setWordWrap(True)
+        top.addWidget(self.forecast_headline, 1)
+        top.addWidget(help_button("forecast"), 0, Qt.AlignTop)
+        v.addLayout(top)
+
+        self.forecast_detail = QLabel("")
+        self.forecast_detail.setObjectName("analysis")
+        self.forecast_detail.setWordWrap(True)
+        self.forecast_detail.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        v.addWidget(self.forecast_detail)
+
+        self.forecast_warning = QLabel("")
+        self.forecast_warning.setObjectName("warning")
+        self.forecast_warning.setWordWrap(True)
+        self.forecast_warning.hide()
+        v.addWidget(self.forecast_warning)
+        return box
+
+    def _watch_settings(self) -> None:
+        """Recompute the forecast whenever any control that affects it moves."""
+        for widget in (self.degrain, self.detail, self.regrain, self.deblock):
+            widget.valueChanged.connect(self._update_forecast)
+        for widget in (self.model_combo, self.fps_mode, self.fps_target):
+            widget.currentIndexChanged.connect(self._update_forecast)
+        self.fps_target.editTextChanged.connect(self._update_forecast)
+        self.fps_multiplier.valueChanged.connect(self._update_forecast)
+        for widget in (self.no_restore, self.cpu):
+            widget.toggled.connect(self._update_forecast)
+
+    def _update_forecast(self) -> None:
+        from .forecast import forecast
+        from .images import is_image
+
+        name = self.model_combo.currentText()
+        path = self.model_combo.currentData()
+        if self.source is None or not path:
+            self.forecast_headline.setText("Load a source and pick a model.")
+            self.forecast_detail.setText("")
+            self.forecast_warning.hide()
+            return
+
+        still = is_image(self.source)
+        if still and self._image_size is not None:
+            width, height = self._image_size
+            fps, frames = 1.0, 1
+        elif self.profile is not None:
+            width, height = self.profile.width, self.profile.height
+            fps, frames = self.profile.fps, self.profile.frame_count
+        else:
+            return
+
+        target = None
+        if not still:
+            mode = self.fps_mode.currentText()
+            if mode == "Target FPS":
+                try:
+                    target = float(self.fps_target.currentText())
+                except ValueError:
+                    target = None
+            elif mode == "Multiplier":
+                target = fps * self.fps_multiplier.value()
+
+        off = self.no_restore.isChecked()
+        result = forecast(
+            width=width, height=height, fps=fps, frames=frames,
+            scale=scale_from_name(name), model_name=name,
+            scan=self._scan_type,
+            deblock=0.0 if off else self.deblock.value() / 100,
+            degrain=0.0 if off else self.degrain.value() / 100,
+            detail_retention=0.0 if off else self.detail.value() / 100,
+            regrain=0.0 if off else self.regrain.value() / 100,
+            target_fps=target,
+            cpu=self.cpu.isChecked(),
+            is_image=still,
+        )
+
+        size_label = f" ({result.label})" if result.label else ""
+        if still:
+            self.forecast_headline.setText(f"{result.resolution}{size_label} image")
+        else:
+            self.forecast_headline.setText(
+                f"{result.resolution}{size_label} at {result.fps:g} fps · "
+                f"{result.frames:,} frames · about {result.time_estimate} · "
+                f"around {result.size_estimate}"
+            )
+
+        self.forecast_detail.setText(
+            "\n".join(f"{i}. {step}" for i, step in enumerate(result.steps, 1))
+        )
+        if result.warnings:
+            self.forecast_warning.setText("\n".join(f"— {w}" for w in result.warnings))
+            self.forecast_warning.show()
+        else:
+            self.forecast_warning.hide()
+
     def _actions(self) -> QHBoxLayout:
         row = QHBoxLayout()
         row.setSpacing(theme.GAP_TIGHT)
@@ -745,6 +867,7 @@ class MainWindow(QMainWindow):
             f"Scan {scan.value} ({analysis.field_order}), "
             f"grain {grain:.2f}, blockiness {blockiness:.2f}",
         ]
+        self._scan_type = scan.value
         if scan.value == "telecined":
             lines.append(
                 "Film carried as interlaced. Inverse telecine will be applied; "
@@ -756,6 +879,7 @@ class MainWindow(QMainWindow):
 
         if self.output_label.text().startswith("("):
             self.output_label.setText(str(path.with_name(path.stem + "_enhanced.mkv")))
+        self._update_forecast()
 
     def _load_image_source(self, path: Path) -> None:
         """Stills take a different path: no frame rate, no scan type, no resume."""
@@ -770,6 +894,8 @@ class MainWindow(QMainWindow):
 
         grain, blockiness = estimate_still_grain(rgb)
         h, w = rgb.shape[:2]
+        self._image_size = (w, h)
+        self._scan_type = "progressive"
         lines = [
             f"Still image, {w}x{h}{', with alpha' if alpha is not None else ''}",
             f"Grain {grain:.2f}, blockiness {blockiness:.2f}",
@@ -785,6 +911,7 @@ class MainWindow(QMainWindow):
 
         if self.output_label.text().startswith("("):
             self.output_label.setText(str(path.with_name(path.stem + "_enhanced" + path.suffix)))
+        self._update_forecast()
 
     def _build_request(self, preview: bool) -> RenderRequest | None:
         model = self.model_combo.currentData()

@@ -161,6 +161,13 @@ HELP: dict[str, str] = {
         "Clear finished, stopped and failed jobs from the list.\n\n"
         "Waiting and running jobs stay."
     ),
+    "forecast": (
+        "What these settings will produce, worked out before anything runs.\n\n"
+        "Size, frame rate, the steps that will be applied, and rough time and "
+        "file size. Updates as you change any control.\n\n"
+        "Times come from throughput measured on this class of card. Treat them "
+        "as a guide; once a render starts, the live speed readout is real."
+    ),
     "guide_button": "Open a page explaining every setting.",
 }
 
@@ -252,6 +259,7 @@ GUIDE_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
         ("Stop", "queue_stop"),
         ("Remove", "queue_remove"),
         ("Clear finished", "queue_clear"),
+        ("What you will get", "forecast"),
         ("Guide", "guide_button"),
     ]),
 ]

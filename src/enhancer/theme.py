@@ -293,6 +293,8 @@ def stylesheet(p: Palette) -> str:
     QLabel#help:hover {{ color: {p.text}; border-color: {p.text_faint}; }}
     QLabel#analysis {{ color: {p.text_muted}; font-size: 12px; }}
     QLabel#status {{ color: {p.text_muted}; font-size: 12px; }}
+    QLabel#headline {{ color: {p.text}; font-size: 14px; font-weight: 600; }}
+    QLabel#warning {{ color: {p.danger}; font-size: 12px; }}
     """
 
 

@@ -15,6 +15,7 @@ REQUIRED_KEYS = [
     "output", "segment_frames", "vram_budget", "cpu",
     "preview_button", "render_button", "cancel_button", "progress",
     "queue", "queue_start", "queue_stop", "queue_remove", "queue_clear",
+    "forecast",
     "guide_button",
 ]
 
@@ -31,7 +32,7 @@ NEEDS_DETAIL = [
     "fps_mode", "fps_target", "fps_multiplier", "scene_threshold",
     "output", "segment_frames", "vram_budget", "cpu",
     "preview_button", "render_button", "progress",
-    "queue", "queue_stop", "queue_remove",
+    "queue", "queue_stop", "queue_remove", "forecast",
 ]
 
 # Plain actions: complete in a line or two, and padding them would be worse.
