@@ -28,6 +28,10 @@ Interpolating across a hard cut produces a visible ghost-morph between two unrel
 
 When the frame-pair difference exceeds the threshold, the nearest source frame is duplicated instead of synthesizing. A duplicated frame at a cut is invisible; a morph across a cut is glaring.
 
+**The metric is a cumulative-histogram distance, not raw histogram intersection.** Raw intersection saturates: with bins at multiples of eight, two nearly identical solid frames at 120 and 128 fall into disjoint bins and score as maximally different, which makes the threshold meaningless. Comparing cumulative distributions instead stays continuous under small shifts regardless of where the bin edges land. Do not "simplify" this back to intersection.
+
+Both properties matter and pull in opposite directions: the metric must ignore a camera pan, which moves every pixel while preserving the colour distribution, yet still fire on a genuine shot change. That is why it is distribution-based rather than per-pixel.
+
 ### Why the frame count is knowable in advance
 
 Unlike inverse telecine (Plan 2), where decimation happens inside ffmpeg and the output length cannot be predicted, interpolation's output length is fully determined by `src_fps`, `dst_fps` and the source frame count. That means segmented resume can be preserved: an output segment maps deterministically back to the source frames it needs.
@@ -420,9 +424,15 @@ def test_copied_frames_are_bit_identical_to_the_source():
 
 
 def test_synthesised_frames_lie_between_their_neighbours():
-    src = [np.full((8, 8, 3), 0, dtype=np.uint8), np.full((8, 8, 3), 200, dtype=np.uint8)]
+    """A 100 to 160 step is a plausible within-shot lighting change.
+
+    Deliberately not 0 to 200: that is a cut by any distribution-based measure,
+    so the detector would correctly duplicate rather than synthesise and this
+    test would be asserting the wrong thing.
+    """
+    src = [np.full((8, 8, 3), 100, dtype=np.uint8), np.full((8, 8, 3), 160, dtype=np.uint8)]
     out = list(interpolate_stream(src, src_fps=24, dst_fps=48, model=FakeFlow()))
-    assert 0 < int(out[1].mean()) < 200
+    assert 100 < int(out[1].mean()) < 160
 
 
 def test_scene_change_duplicates_instead_of_synthesising():
