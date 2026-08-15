@@ -23,14 +23,17 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QSpinBox,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
 from .analyze import classify_scan, estimate_blockiness, estimate_grain, probe_scan
 from .gui import CancelledError, RenderJob
+from .help_text import HELP, describe_model
 from .models import scan_custom_dir
 from .requests import RenderRequest
 from .video_io import Decoder, SourceProfile
@@ -103,11 +106,44 @@ def _slider(minimum: int, maximum: int, value: int) -> QSlider:
     return s
 
 
+def help_button(key: str) -> QLabel:
+    """A small '?' that explains a control on hover.
+
+    Tooltip text lives in `help_text.py` so the wording can be reviewed and
+    tested without touching widget code. Qt wraps plain text at a sensible
+    width once the tooltip is long enough, so the newlines in the source read
+    as paragraph breaks.
+    """
+    label = QLabel("?")
+    label.setToolTip(HELP.get(key, "No description available."))
+    label.setAlignment(Qt.AlignCenter)
+    label.setFixedSize(18, 18)
+    label.setCursor(Qt.WhatsThisCursor)
+    label.setStyleSheet(
+        "QLabel { border: 1px solid palette(mid); border-radius: 9px;"
+        " color: palette(mid); font-size: 11px; font-weight: bold; }"
+        "QLabel:hover { color: palette(highlight); border-color: palette(highlight); }"
+    )
+    return label
+
+
+def with_help(widget: QWidget, key: str) -> QWidget:
+    """Pair a control with its '?' button on one row."""
+    holder = QWidget()
+    row = QHBoxLayout(holder)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(6)
+    row.addWidget(widget, 1)
+    row.addWidget(help_button(key), 0, Qt.AlignTop)
+    return holder
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Enhancer")
-        self.resize(760, 900)
+        self.setMinimumSize(900, 560)
+        self.resize(1280, 780)
         self.setAcceptDrops(True)
 
         self.source: Path | None = None
@@ -116,13 +152,33 @@ class MainWindow(QMainWindow):
         self.worker: Worker | None = None
         self._started_at = 0.0
 
+        # Landscape: settings in two columns side by side, progress spanning the
+        # full width beneath. The splitter lets the columns be rebalanced, and
+        # every group expands with the window rather than sitting at a fixed size.
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 6, 0)
+        left_layout.addWidget(self._source_group(), 1)
+        left_layout.addWidget(self._model_group())
+        left_layout.addWidget(self._output_group())
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(6, 0, 0, 0)
+        right_layout.addWidget(self._texture_group())
+        right_layout.addWidget(self._fps_group())
+        right_layout.addStretch(1)
+
+        self.columns = QSplitter(Qt.Horizontal)
+        self.columns.addWidget(left)
+        self.columns.addWidget(right)
+        self.columns.setStretchFactor(0, 3)
+        self.columns.setStretchFactor(1, 2)
+        self.columns.setChildrenCollapsible(False)
+
         root = QWidget()
         layout = QVBoxLayout(root)
-        layout.addWidget(self._source_group())
-        layout.addWidget(self._model_group())
-        layout.addWidget(self._texture_group())
-        layout.addWidget(self._fps_group())
-        layout.addWidget(self._output_group())
+        layout.addWidget(self.columns, 1)
         layout.addLayout(self._actions())
         layout.addWidget(self._progress_group())
         self.setCentralWidget(root)
@@ -137,12 +193,16 @@ class MainWindow(QMainWindow):
     def _source_group(self) -> QGroupBox:
         box = QGroupBox("Source")
         v = QVBoxLayout(box)
-        self.drop_label = QLabel("Drop a video here, or use Browse")
+
+        self.drop_label = QLabel("Drop a video or image here, or use Browse")
         self.drop_label.setAlignment(Qt.AlignCenter)
+        self.drop_label.setWordWrap(True)
+        self.drop_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.drop_label.setMinimumHeight(70)
         self.drop_label.setStyleSheet(
-            "border: 2px dashed palette(mid); padding: 24px; border-radius: 6px;"
+            "border: 2px dashed palette(mid); padding: 16px; border-radius: 6px;"
         )
-        v.addWidget(self.drop_label)
+        v.addWidget(with_help(self.drop_label, "source"))
 
         browse = QPushButton("Browse...")
         browse.clicked.connect(self._browse_source)
@@ -151,80 +211,123 @@ class MainWindow(QMainWindow):
         self.analysis = QLabel("No source loaded.")
         self.analysis.setWordWrap(True)
         self.analysis.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        v.addWidget(self.analysis)
+        self.analysis.setAlignment(Qt.AlignTop)
+        self.analysis.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        v.addWidget(with_help(self.analysis, "analysis"), 1)
         return box
 
     def _model_group(self) -> QGroupBox:
         box = QGroupBox("Model")
         f = QFormLayout(box)
+        f.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.model_combo = QComboBox()
+        self.model_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._reload_models()
-        f.addRow("Weights", self.model_combo)
+        self.model_combo.currentIndexChanged.connect(self._show_model_note)
+        f.addRow("Weights", with_help(self.model_combo, "model"))
+
+        self.model_note = QLabel("")
+        self.model_note.setWordWrap(True)
+        self.model_note.setStyleSheet("color: palette(mid); font-size: 11px;")
+        f.addRow("", self.model_note)
+        self._show_model_note()
+
         refresh = QPushButton("Rescan models/custom")
         refresh.clicked.connect(self._reload_models)
-        f.addRow("", refresh)
+        f.addRow("", with_help(refresh, "rescan"))
         return box
 
     def _texture_group(self) -> QGroupBox:
         box = QGroupBox("Restoration and texture")
         f = QFormLayout(box)
+        f.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
         self.no_restore = QCheckBox("Skip all restoration (fastest, for previews)")
-        f.addRow("", self.no_restore)
+        f.addRow("", with_help(self.no_restore, "no_restore"))
 
         self.degrain = _slider(0, 100, 25)
-        f.addRow("Degrain", self._labelled(self.degrain, "higher removes more grain and more skin texture"))
+        f.addRow("Degrain", self._labelled(
+            self.degrain, "degrain",
+            "higher removes more grain — and more skin texture"))
 
         self.detail = _slider(0, 100, 25)
-        f.addRow("Detail retention", self._labelled(self.detail, "restores real detail from the source"))
+        f.addRow("Detail retention", self._labelled(
+            self.detail, "detail",
+            "restores real detail from your source file"))
 
         self.regrain = _slider(0, 100, 60)
-        f.addRow("Re-grain", self._labelled(self.regrain, "puts back the texture that makes skin look photographed"))
+        f.addRow("Re-grain", self._labelled(
+            self.regrain, "regrain",
+            "the strongest fix for plastic-looking skin"))
 
         self.deblock = _slider(0, 100, 0)
-        f.addRow("Deblock", self._labelled(self.deblock, "raise for YouTube and low-bitrate sources"))
+        f.addRow("Deblock", self._labelled(
+            self.deblock, "deblock",
+            "raise for YouTube and low-bitrate sources"))
         return box
 
-    def _labelled(self, slider: QSlider, hint: str) -> QWidget:
+    def _labelled(self, slider: QSlider, key: str, hint: str) -> QWidget:
         w = QWidget()
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
         row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         value = QLabel(f"{slider.value() / 100:.2f}")
+        value.setFixedWidth(34)
         slider.valueChanged.connect(lambda n: value.setText(f"{n / 100:.2f}"))
-        row.addWidget(slider)
+        slider.setToolTip(HELP.get(key, ""))
+        row.addWidget(slider, 1)
         row.addWidget(value)
+        row.addWidget(help_button(key))
         v.addLayout(row)
         note = QLabel(hint)
+        note.setWordWrap(True)
         note.setStyleSheet("color: palette(mid); font-size: 11px;")
         v.addWidget(note)
         return w
 
     def _fps_group(self) -> QGroupBox:
-        box = QGroupBox("Frame rate")
+        box = QGroupBox("Frame rate (make motion smoother)")
         f = QFormLayout(box)
+        f.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
         self.fps_mode = QComboBox()
         self.fps_mode.addItems(["Off", "Target FPS", "Multiplier"])
-        f.addRow("Mode", self.fps_mode)
+        for i, note in enumerate([
+            "Keep the source frame rate exactly as it is.",
+            "Name the frame rate you want out, such as 60.",
+            "Multiply whatever the source happens to be, such as 2x.",
+        ]):
+            self.fps_mode.setItemData(i, note, Qt.ToolTipRole)
+        f.addRow("Mode", with_help(self.fps_mode, "fps_mode"))
 
         self.fps_target = QComboBox()
         self.fps_target.setEditable(True)
         self.fps_target.addItems(["48", "50", "60", "120"])
+        for i, note in enumerate([
+            "48 — a gentle lift from 24, keeps some of the cinema feel.",
+            "50 — for PAL sources and European televisions.",
+            "60 — smooth playback on a normal screen. The usual choice.",
+            "120 — high refresh-rate screens, or for slowing down later.",
+        ]):
+            self.fps_target.setItemData(i, note, Qt.ToolTipRole)
         self.fps_target.setCurrentText("60")
-        f.addRow("Target", self.fps_target)
+        f.addRow("Target", with_help(self.fps_target, "fps_target"))
 
         self.fps_multiplier = QDoubleSpinBox()
         self.fps_multiplier.setRange(1.0, 8.0)
         self.fps_multiplier.setValue(2.0)
-        f.addRow("Multiplier", self.fps_multiplier)
+        f.addRow("Multiplier", with_help(self.fps_multiplier, "fps_multiplier"))
 
         self.scene_threshold = QDoubleSpinBox()
         self.scene_threshold.setRange(0.0, 1.0)
         self.scene_threshold.setSingleStep(0.05)
         self.scene_threshold.setValue(0.30)
-        f.addRow("Cut sensitivity", self.scene_threshold)
+        f.addRow("Cut sensitivity", with_help(self.scene_threshold, "scene_threshold"))
 
         self.fps_note = QLabel("")
+        self.fps_note.setWordWrap(True)
         self.fps_note.setStyleSheet("color: palette(mid); font-size: 11px;")
         f.addRow("", self.fps_note)
         self._check_rife()
@@ -233,8 +336,12 @@ class MainWindow(QMainWindow):
     def _output_group(self) -> QGroupBox:
         box = QGroupBox("Output")
         f = QFormLayout(box)
+        f.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
         self.output_label = QLabel("(chosen automatically beside the source)")
-        f.addRow("File", self.output_label)
+        self.output_label.setWordWrap(True)
+        f.addRow("File", with_help(self.output_label, "output"))
+
         pick = QPushButton("Choose output...")
         pick.clicked.connect(self._browse_output)
         f.addRow("", pick)
@@ -242,38 +349,56 @@ class MainWindow(QMainWindow):
         self.segment_frames = QSpinBox()
         self.segment_frames.setRange(30, 10000)
         self.segment_frames.setValue(500)
-        f.addRow("Segment frames", self.segment_frames)
+        f.addRow("Segment frames", with_help(self.segment_frames, "segment_frames"))
 
         self.cpu = QCheckBox("Force CPU (very slow)")
-        f.addRow("", self.cpu)
+        f.addRow("", with_help(self.cpu, "cpu"))
         return box
 
     def _actions(self) -> QHBoxLayout:
         row = QHBoxLayout()
         self.preview_button = QPushButton(f"Preview {PREVIEW_SECONDS}s")
+        self.preview_button.setToolTip(HELP["preview_button"])
         self.preview_button.clicked.connect(lambda: self._start(preview=True))
         self.render_button = QPushButton("Render")
+        self.render_button.setToolTip(HELP["render_button"])
         self.render_button.clicked.connect(lambda: self._start(preview=False))
         self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setToolTip(HELP["cancel_button"])
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel)
-        row.addWidget(self.preview_button)
-        row.addWidget(self.render_button)
-        row.addWidget(self.cancel_button)
+
+        row.addWidget(self.preview_button, 1)
+        row.addWidget(help_button("preview_button"))
+        row.addWidget(self.render_button, 1)
+        row.addWidget(help_button("render_button"))
+        row.addWidget(self.cancel_button, 1)
+        row.addWidget(help_button("cancel_button"))
         return row
 
     def _progress_group(self) -> QGroupBox:
         box = QGroupBox("Progress")
         v = QVBoxLayout(box)
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
         self.bar = QProgressBar()
-        v.addWidget(self.bar)
+        top.addWidget(self.bar, 1)
+        top.addWidget(help_button("progress"))
+        v.addLayout(top)
+
         self.status = QLabel("Idle.")
         v.addWidget(self.status)
+
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(500)
+        self.log_view.setMinimumHeight(90)
         v.addWidget(self.log_view)
         return box
+
+    def _show_model_note(self) -> None:
+        name = self.model_combo.currentText()
+        self.model_note.setText(describe_model(name).split("\n\n")[0] if name else "")
 
     # --- behaviour ----------------------------------------------------------
 
@@ -282,8 +407,20 @@ class MainWindow(QMainWindow):
         found = scan_custom_dir(Path("models/custom"))
         if not found:
             self.model_combo.addItem("No models in models/custom", None)
+            self.model_combo.setItemData(
+                0,
+                "Download one with:  enhancer models --get 2xParimgCompact\n"
+                "Or drop any .pth into the models\\custom folder.",
+                Qt.ToolTipRole,
+            )
         for p in found:
             self.model_combo.addItem(p.name, str(p))
+            # Per-entry tooltip: which kind of footage this one suits.
+            self.model_combo.setItemData(
+                self.model_combo.count() - 1, describe_model(p.name), Qt.ToolTipRole
+            )
+        if hasattr(self, "model_note"):
+            self._show_model_note()
 
     def _check_rife(self) -> None:
         from .cli import rife_weights

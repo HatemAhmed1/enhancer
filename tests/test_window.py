@@ -184,3 +184,75 @@ def test_image_request_has_no_target_fps_or_preview(window, png, tmp_path):
     assert req is not None
     assert req.target_fps is None
     assert req.preview_frames is None
+
+
+# --- help and layout --------------------------------------------------------
+
+
+def test_window_opens_landscape_not_portrait(window):
+    assert window.width() > window.height(), "the window must be wider than it is tall"
+
+
+def test_window_is_resizable_and_has_no_fixed_size(window):
+    assert window.minimumWidth() < window.width()
+    assert window.maximumWidth() > 10000, "a maximum would stop it growing"
+
+
+def test_settings_are_laid_out_in_two_columns(window):
+    assert window.columns.count() == 2
+
+
+def test_columns_cannot_be_collapsed_to_nothing(window):
+    assert not window.columns.childrenCollapsible()
+
+
+def test_every_slider_carries_its_explanation(window):
+    for slider in (window.degrain, window.detail, window.regrain, window.deblock):
+        assert len(slider.toolTip()) > 60
+
+
+def test_action_buttons_carry_explanations(window):
+    for button in (window.preview_button, window.render_button, window.cancel_button):
+        assert len(button.toolTip()) > 60
+
+
+def test_every_model_entry_explains_what_it_suits(window):
+    from PySide6.QtCore import Qt
+
+    for i in range(window.model_combo.count()):
+        note = window.model_combo.itemData(i, Qt.ToolTipRole)
+        assert note, f"model entry {i} has no tooltip"
+        assert len(note) > 40
+
+
+def test_frame_rate_mode_entries_are_each_explained(window):
+    from PySide6.QtCore import Qt
+
+    for i in range(window.fps_mode.count()):
+        assert window.fps_mode.itemData(i, Qt.ToolTipRole)
+
+
+def test_frame_rate_presets_are_each_explained(window):
+    from PySide6.QtCore import Qt
+
+    for i in range(window.fps_target.count()):
+        note = window.fps_target.itemData(i, Qt.ToolTipRole)
+        assert note and window.fps_target.itemText(i) in note
+
+
+def test_help_button_carries_the_matching_text(window):
+    from enhancer.help_text import HELP
+    from enhancer.window import help_button
+
+    assert help_button("degrain").toolTip() == HELP["degrain"]
+
+
+def test_help_button_for_an_unknown_key_does_not_crash(window):
+    from enhancer.window import help_button
+
+    assert help_button("no_such_control").toolTip()
+
+
+def test_model_note_appears_under_the_dropdown(window):
+    if window.model_combo.currentData():
+        assert window.model_note.text()
