@@ -12,3 +12,6 @@ build/
 dist/
 *.spec.bak
 build_log.txt
+
+# Local working notes, not part of the project
+CLAUDE.md

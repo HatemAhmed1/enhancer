@@ -39,13 +39,20 @@ def test_arguments_are_passed_through_to_the_command_line(monkeypatch, tmp_path,
 
 
 def test_no_arguments_opens_the_window(monkeypatch):
+    """With no arguments the window opens, by way of the startup splash.
+
+    The splash exists because loading the graphics libraries takes tens of
+    seconds in a packaged build, and an application showing nothing for that
+    long reads as broken.
+    """
     import enhancer.__main__ as entry
 
     opened = []
     monkeypatch.setattr(sys, "argv", ["enhancer"])
-    monkeypatch.setattr("enhancer.window.launch", lambda argv: opened.append(argv) or 0)
+    monkeypatch.setattr("enhancer.splash.run_with_splash",
+                        lambda: opened.append(True) or 0)
     assert entry.main() == 0
-    assert opened == [[]]
+    assert opened == [True]
 
 
 def test_module_runs_as_a_script():
