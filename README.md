@@ -97,6 +97,22 @@ You can also drop any [OpenModelDB](https://openmodeldb.info/) `.pth` straight i
 
 ---
 
+## Building a standalone executable
+
+Optional. Produces `dist\Enhancer\Enhancer.exe`, which runs without Python installed.
+
+```powershell
+.\build_exe.bat
+```
+
+Takes 10–20 minutes and produces roughly 5 GB, nearly all of it PyTorch and the CUDA runtime — the graphics code is the application, so there is no trimming it meaningfully.
+
+It is a folder, not a single file, deliberately: a one-file build of this size unpacks itself to a temporary directory on every launch and takes half a minute to appear. Copy the whole `dist\Enhancer` folder to move it. Models are read from `models\custom` and `models\rife` beside the executable.
+
+ffmpeg is still required on `PATH`; it is not bundled.
+
+---
+
 ## Usage
 
 **Open the desktop window**
