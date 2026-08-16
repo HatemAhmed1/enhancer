@@ -15,3 +15,5 @@ build_log.txt
 
 # Local working notes, not part of the project
 CLAUDE.md
+exe_test.txt
+out/
