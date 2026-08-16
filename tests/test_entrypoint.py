@@ -70,3 +70,30 @@ def test_entry_point_uses_absolute_imports():
     offenders = [line.strip() for line in source.splitlines()
                  if line.strip().startswith("from .")]
     assert not offenders, f"relative imports break the packaged build: {offenders}"
+
+
+def test_build_excludes_only_whole_packages():
+    """Excluding a submodule of a package that is kept breaks that package.
+
+    torchvision.models.__init__ imports .detection by name; excluding it turned
+    a working import into a circular-import failure at startup, visible only in
+    the packaged application.
+    """
+    import ast
+    import pathlib
+
+    spec = pathlib.Path("enhancer.spec").read_text(encoding="utf-8")
+    tree = ast.parse(spec)
+    excludes: list[str] = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign)
+                and any(getattr(t, "id", "") == "excludes" for t in node.targets)):
+            excludes = [e.value for e in node.value.elts if isinstance(e, ast.Constant)]
+
+    assert excludes, "could not read the exclude list from the build definition"
+    kept_roots = {"torch", "torchvision", "spandrel", "numpy", "yt_dlp"}
+    for name in excludes:
+        root = name.split(".")[0]
+        assert root not in kept_roots, (
+            f"{name!r} excludes part of {root!r}, which the application needs"
+        )

@@ -30,12 +30,17 @@ hiddenimports += collect_submodules("yt_dlp.extractor")
 # The vendored RIFE network is imported by path at runtime.
 hiddenimports += ["enhancer.rife", "enhancer.rife.ifnet"]
 
-# Large packages that are pulled in transitively but never used.
+# Large packages pulled in transitively but never used.
+#
+# Only whole top-level packages, never a submodule of one that is kept.
+# Excluding torchvision.models.detection broke the build outright, because
+# torchvision.models.__init__ imports it by name — the exclusion turned a
+# working import into a circular-import failure at startup, and only in the
+# packaged application.
 excludes = [
     "tkinter", "matplotlib", "IPython", "jupyter", "notebook",
     "pytest", "_pytest", "pytest_qt", "setuptools", "pip",
-    "torch.utils.tensorboard", "torch.distributed.elastic",
-    "torchvision.datasets", "torchvision.models.detection",
+    "tensorboard", "pandas", "scipy",
     "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.Qt3DCore",
     "PySide6.QtCharts", "PySide6.QtDataVisualization", "PySide6.QtMultimedia",
     "PySide6.QtQuick", "PySide6.QtQml", "PySide6.Qt3DRender",
