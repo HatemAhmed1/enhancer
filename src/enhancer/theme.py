@@ -11,6 +11,7 @@ Colours are the shadcn "neutral" scale converted from HSL to hex.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 
 
 @dataclass(frozen=True)
@@ -78,11 +79,85 @@ CONTROL_HEIGHT = 30
 # Clear air above a group so its title never crowds the box above.
 GROUP_TITLE_SPACE = 26
 
+# The letterbox behind the picture in the comparison viewer, and the text drawn
+# on it before a pair is loaded.
+#
+# These two deliberately do NOT follow the palette, and are the only colours in
+# the application that do not. The viewer exists to answer one question — did
+# skin keep its texture, or did it turn to wax — and that judgement is made by
+# eye. A surround shifts the tones you perceive in the picture it surrounds, so
+# a backdrop that flipped from near-black to near-white with the interface
+# theme would change what the user thinks they are seeing in the frame without
+# anything in the frame having changed. A fixed mid-grey is the darkroom
+# convention for exactly this reason: neutral, and biased neither way.
+#
+# Mid-grey also reads as deliberate against both palettes, which near-black
+# (invisible in dark) and near-white (invisible in light) would not.
+VIEWER_BACKDROP = "#525252"       # neutral-600
+VIEWER_BACKDROP_TEXT = "#d4d4d4"  # neutral-300, legible on the above
+
+
+class Mode(str, Enum):
+    """What the user asked for, which is not the same as which palette wins.
+
+    SYSTEM is a deferral: it means "whatever Windows is set to right now", and
+    is resolved afresh every time the theme is applied.
+    """
+
+    SYSTEM = "system"
+    LIGHT = "light"
+    DARK = "dark"
+
+
+# Where the preference lives. QSettings picks the per-user registry key on
+# Windows; the organisation and application names must not drift, or a user's
+# saved choice quietly disappears.
+_ORG = "Enhancer"
+_APP = "Enhancer"
+_KEY = "theme/mode"
+
 
 def is_dark(app) -> bool:
     """Follow the system light or dark setting."""
     colour = app.palette().window().color()
     return colour.value() < 128
+
+
+def resolve(app, mode: Mode) -> Palette:
+    """The palette a mode means right now. SYSTEM consults the OS."""
+    if mode is Mode.LIGHT:
+        return LIGHT
+    if mode is Mode.DARK:
+        return DARK
+    return DARK if is_dark(app) else LIGHT
+
+
+def _settings():
+    """QSettings, imported here so the module stays importable without Qt."""
+    from PySide6.QtCore import QSettings
+
+    return QSettings(_ORG, _APP)
+
+
+def load_mode() -> Mode:
+    """The saved preference, SYSTEM when nothing is saved or the value is junk."""
+    try:
+        saved = _settings().value(_KEY)
+    except Exception:
+        return Mode.SYSTEM
+    if saved is None:
+        return Mode.SYSTEM
+    try:
+        return Mode(str(saved).strip().lower())
+    except ValueError:
+        return Mode.SYSTEM
+
+
+def save_mode(mode: Mode) -> None:
+    """Remember the preference for the next launch."""
+    settings = _settings()
+    settings.setValue(_KEY, Mode(mode).value)
+    settings.sync()
 
 
 def stylesheet(p: Palette) -> str:
@@ -127,8 +202,18 @@ def stylesheet(p: Palette) -> str:
         min-height: {CONTROL_HEIGHT - 12}px;
         font-weight: 500;
     }}
-    QPushButton:hover {{ border-color: {p.text_faint}; }}
-    QPushButton:pressed {{ background-color: {p.border}; }}
+    QPushButton:hover {{
+        background-color: {p.selection};
+        border-color: {p.text_faint};
+    }}
+    QPushButton:pressed {{
+        background-color: {p.border};
+        border-color: {p.text_faint};
+    }}
+    QPushButton:focus {{
+        border: 1px solid {p.accent};
+        outline: none;
+    }}
     QPushButton:disabled {{
         color: {p.text_faint};
         border-color: {p.border};
@@ -141,6 +226,11 @@ def stylesheet(p: Palette) -> str:
         font-weight: 600;
     }}
     QPushButton#primary:hover {{ background-color: {p.text}; }}
+    QPushButton#primary:pressed {{
+        background-color: {p.text_muted};
+        border-color: {p.text_muted};
+    }}
+    QPushButton#primary:focus {{ border: 1px solid {p.text_muted}; }}
     QPushButton#primary:disabled {{
         background-color: {p.surface_raised};
         color: {p.text_faint};
@@ -155,8 +245,19 @@ def stylesheet(p: Palette) -> str:
         min-height: {CONTROL_HEIGHT - 10}px;
         selection-background-color: {p.selection};
     }}
-    QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover {{
+    QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover, QLineEdit:hover {{
         border-color: {p.text_faint};
+    }}
+    QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus {{
+        border: 1px solid {p.accent};
+        outline: none;
+    }}
+    QComboBox:on {{ border-color: {p.accent}; }}
+    QComboBox:disabled, QSpinBox:disabled,
+    QDoubleSpinBox:disabled, QLineEdit:disabled {{
+        color: {p.text_faint};
+        background-color: {p.surface};
+        border-color: {p.border};
     }}
     QComboBox::drop-down {{ border: none; width: 18px; }}
     QComboBox QAbstractItemView {{
@@ -176,9 +277,18 @@ def stylesheet(p: Palette) -> str:
         border-radius: 3px;
         background-color: {p.surface_raised};
     }}
+    QCheckBox::indicator:hover {{ border-color: {p.text_faint}; }}
     QCheckBox::indicator:checked {{
         background-color: {p.accent};
         border-color: {p.accent};
+    }}
+    QCheckBox::indicator:checked:hover {{ background-color: {p.text}; }}
+    QCheckBox:focus {{ outline: none; }}
+    QCheckBox::indicator:focus {{ border: 1px solid {p.accent}; }}
+    QCheckBox:disabled {{ color: {p.text_faint}; }}
+    QCheckBox::indicator:disabled {{
+        background-color: {p.surface};
+        border-color: {p.border};
     }}
 
     QSlider::groove:horizontal {{
@@ -198,6 +308,14 @@ def stylesheet(p: Palette) -> str:
         border-radius: 7px;
     }}
     QSlider::handle:horizontal:hover {{ background: {p.text}; }}
+    QSlider::handle:horizontal:pressed {{ background: {p.text_muted}; }}
+    QSlider::handle:horizontal:disabled {{ background: {p.border_strong}; }}
+    QSlider::sub-page:horizontal:disabled {{ background: {p.border_strong}; }}
+    QSlider:focus {{ outline: none; }}
+    QSlider:focus::handle:horizontal {{
+        border: 1px solid {p.accent};
+        margin: -6px 0;
+    }}
 
     QProgressBar {{
         background-color: {p.border};
@@ -291,6 +409,110 @@ def stylesheet(p: Palette) -> str:
         font-weight: 600;
     }}
     QLabel#help:hover {{ color: {p.text}; border-color: {p.text_faint}; }}
+    QLabel#caption {{
+        color: {p.text_faint};
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.8px;
+    }}
+
+    QFrame#card {{
+        background-color: {p.surface_raised};
+        border: 1px solid {p.border};
+        border-radius: {RADIUS}px;
+    }}
+
+    /* Segmented A/B switch: buttons sit in a row and read as one control,
+       so the selected one is filled rather than merely outlined. */
+    QPushButton#segment {{
+        background-color: {p.surface};
+        color: {p.text_muted};
+        border: 1px solid {p.border};
+        border-radius: {RADIUS}px;
+        padding: 4px {GAP_TIGHT}px;
+        min-height: {CONTROL_HEIGHT - 14}px;
+        font-size: 12px;
+        font-weight: 500;
+    }}
+    QPushButton#segment:hover {{
+        background-color: {p.surface_raised};
+        color: {p.text};
+    }}
+    QPushButton#segment:focus {{ border: 1px solid {p.accent}; }}
+    QPushButton#segment:checked {{
+        background-color: {p.accent};
+        color: {p.accent_text};
+        border-color: {p.accent};
+        font-weight: 600;
+    }}
+    QPushButton#segment:checked:hover {{
+        background-color: {p.text};
+        border-color: {p.text};
+        color: {p.accent_text};
+    }}
+    QPushButton#segment:disabled {{
+        color: {p.text_faint};
+        background-color: {p.surface};
+        border-color: {p.border};
+    }}
+
+    /* The settings tabs are the primary navigation of the panel, so they are
+       styled as the same segmented control as #segment above rather than as
+       chrome-style tabs: one filled, the rest outlined. Every tab carries an
+       explicit colour and border — left unstyled, an unselected tab inherited
+       the window's text colour on the window's background and vanished
+       outright in the light palette, which hid three quarters of the settings.
+       The pane is a hairline only: the groups inside already have borders, and
+       a second frame around them would double up. */
+    QTabWidget::pane {{
+        background: transparent;
+        border: none;
+        border-top: 1px solid {p.border};
+        top: -1px;
+    }}
+    QTabWidget::tab-bar {{ left: 0; }}
+    QTabBar {{ background: transparent; }}
+    QTabBar::tab {{
+        background-color: {p.surface};
+        color: {p.text_muted};
+        border: 1px solid {p.border};
+        border-radius: {RADIUS}px;
+        padding: {GAP_TIGHT}px {GAP}px;
+        margin-right: {GAP_TIGHT}px;
+        margin-bottom: {GAP_TIGHT}px;
+        min-height: {CONTROL_HEIGHT - 16}px;
+        font-size: 12px;
+        font-weight: 500;
+    }}
+    QTabBar::tab:!selected {{
+        background-color: {p.surface};
+        color: {p.text_muted};
+        border-color: {p.border};
+    }}
+    QTabBar::tab:!selected:hover {{
+        background-color: {p.surface_raised};
+        color: {p.text};
+        border-color: {p.border_strong};
+    }}
+    QTabBar::tab:focus {{ border: 1px solid {p.accent}; }}
+    QTabBar::tab:selected {{
+        background-color: {p.accent};
+        color: {p.accent_text};
+        border-color: {p.accent};
+        font-weight: 600;
+    }}
+    QTabBar::tab:selected:hover {{
+        background-color: {p.text};
+        border-color: {p.text};
+        color: {p.accent_text};
+    }}
+    QTabBar::tab:disabled {{
+        background-color: {p.surface};
+        color: {p.text_faint};
+        border-color: {p.border};
+    }}
+
     QLabel#analysis {{ color: {p.text_muted}; font-size: 12px; }}
     QLabel#status {{ color: {p.text_muted}; font-size: 12px; }}
     QLabel#headline {{ color: {p.text}; font-size: 14px; font-weight: 600; }}
@@ -298,8 +520,18 @@ def stylesheet(p: Palette) -> str:
     """
 
 
-def apply(app) -> Palette:
-    """Apply the theme, following the system light or dark setting."""
-    palette = DARK if is_dark(app) else LIGHT
+def apply(app, mode: Mode | None = None) -> Palette:
+    """Apply the theme. `None` means: use the saved preference.
+
+    An explicit mode is a choice the user just made, so it is written back.
+    The saved one is only read — rewriting it on every launch would churn the
+    settings file for nothing.
+    """
+    if mode is None:
+        mode = load_mode()
+    else:
+        mode = Mode(mode)
+        save_mode(mode)
+    palette = resolve(app, mode)
     app.setStyleSheet(stylesheet(palette))
     return palette
