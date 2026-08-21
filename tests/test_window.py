@@ -198,12 +198,20 @@ def test_window_is_resizable_and_has_no_fixed_size(window):
     assert window.maximumWidth() > 10000, "a maximum would stop it growing"
 
 
-def test_settings_are_laid_out_in_two_columns(window):
+def test_the_picture_sits_beside_the_settings(window):
+    """Viewer on the left, settings on the right, rebalanceable."""
     assert window.columns.count() == 2
+    assert window.columns.widget(0) is window.view.parent()
 
 
 def test_columns_cannot_be_collapsed_to_nothing(window):
     assert not window.columns.childrenCollapsible()
+
+
+def test_progress_can_be_resized_but_not_collapsed(window):
+    """Fixed, it took a third of the window to show one bar and an empty box."""
+    assert window.rows.count() == 2
+    assert not window.rows.childrenCollapsible()
 
 
 def test_every_slider_carries_its_explanation(window):
@@ -474,3 +482,116 @@ def test_group_titles_have_clear_air_above_them(window):
     from enhancer import theme
 
     assert theme.GROUP_TITLE_SPACE >= theme.GAP_WIDE
+
+
+# --- before and after -------------------------------------------------------
+
+
+def test_every_settings_group_is_reachable_as_a_tab(window):
+    """Six groups, six tabs, one group each.
+
+    Stacking Source above the tabs squeezed the pages to about a hundred and
+    fifty pixels, which hid Degrain, Detail retention and Re-grain behind a
+    scrollbar — the three controls that decide whether faces come out waxy.
+    """
+    names = [window.tabs.tabText(i) for i in range(window.tabs.count())]
+    assert names == ["Source", "Model", "Texture", "Motion", "Performance", "Queue"]
+
+
+def test_the_forecast_is_not_hidden_behind_a_scrollbar(window):
+    """It exists to be read immediately before pressing Render."""
+    parent = window.forecast_headline
+    while parent is not None and parent is not window.scroll:
+        parent = parent.parent()
+    assert parent is not window.scroll, "the forecast scrolled out of sight"
+
+
+def test_compare_is_refused_until_a_source_is_loaded(window):
+    assert not window.compare_button.isEnabled()
+    assert not window.compare_time.isEnabled()
+
+
+def test_the_frame_picker_spans_the_clip(window, monkeypatch, tmp_path):
+    """Offering a timestamp past the end would decode nothing."""
+    from enhancer.video_io import SourceProfile
+
+    src = tmp_path / "clip.mkv"
+    src.write_bytes(b"")
+    profile = SourceProfile(
+        path=src, width=320, height=240, fps=25.0, frame_count=250,
+        pix_fmt="yuv420p", sar="1:1", interlaced=False, field_order="tff",
+        color_primaries="", color_transfer="", color_space="", duration=10.0,
+    )
+    monkeypatch.setattr(SourceProfile, "probe", staticmethod(lambda p: profile))
+    monkeypatch.setattr("enhancer.window.probe_scan", lambda p: _flat_scan())
+    monkeypatch.setattr("enhancer.window.classify_scan", lambda a: _progressive())
+    monkeypatch.setattr("enhancer.window.estimate_grain", lambda f: 1.0)
+    monkeypatch.setattr("enhancer.window.estimate_blockiness", lambda f: 1.0)
+    monkeypatch.setattr(
+        "enhancer.window.Decoder",
+        lambda *a, **k: type("D", (), {"frames": lambda self: iter([_frame()])})(),
+    )
+    window._load_source(src)
+
+    assert window.compare_button.isEnabled()
+    assert window.compare_time.isEnabled()
+    assert window.compare_time.maximum() == pytest.approx(9.9)
+
+
+def test_a_still_has_no_timeline_to_pick_from(window, tmp_path):
+    from PIL import Image
+
+    src = tmp_path / "still.png"
+    Image.new("RGB", (64, 48), (10, 20, 30)).save(src)
+    window._load_source(src)
+
+    assert window.compare_button.isEnabled(), "a still can still be compared"
+    assert not window.compare_time.isEnabled()
+    assert window.compare_time.maximum() == 0.0
+
+
+def test_the_theme_toggle_flips_and_is_remembered(window, monkeypatch):
+    from enhancer import theme
+
+    saved = []
+    monkeypatch.setattr(theme, "save_mode", lambda m: saved.append(m))
+
+    before = window.theme_button.text()
+    window._toggle_theme()
+    after = window.theme_button.text()
+
+    assert before != after, "the toggle did not change what it offers"
+    assert window.theme_mode in (theme.Mode.LIGHT, theme.Mode.DARK)
+    assert saved and saved[-1] is window.theme_mode
+
+
+def _frame():
+    import numpy as np
+
+    return np.zeros((240, 320, 3), dtype=np.uint8)
+
+
+def _flat_scan():
+    from enhancer.analyze import FieldAnalysis
+
+    return FieldAnalysis(tff=0, bff=0, progressive=100, undetermined=0,
+                         repeated_top=0, repeated_bottom=0)
+
+
+def _progressive():
+    from enhancer.analyze import ScanType
+
+    return ScanType.PROGRESSIVE
+
+
+def test_closing_mid_comparison_does_not_abort_the_process(window):
+    """A QThread deleted while running takes the whole application down."""
+    from PySide6.QtCore import QThread
+
+    thread = QThread()
+    thread.start()
+    window.compare_thread = thread
+    window.close()
+
+    assert window.compare_thread is None
+    assert not thread.isRunning()

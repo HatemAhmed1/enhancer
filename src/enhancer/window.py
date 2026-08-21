@@ -29,9 +29,11 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QScrollArea,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextBrowser,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -136,6 +138,48 @@ class Worker(QObject):
             self.log.emit(traceback.format_exc())
 
 
+class CompareWorker(QObject):
+    """Renders one frame with the current settings, on a background thread.
+
+    Separate from `Worker` because it must never touch the job journal, write
+    an output file, or disturb a render that is already running. Its whole
+    purpose is to answer "will faces look waxy?" in about a second rather than
+    after seventeen hours.
+    """
+
+    ready = Signal(object)
+    log = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, request: RenderRequest, seconds: float) -> None:
+        super().__init__()
+        self.request = request
+        self.seconds = seconds
+
+    def run(self) -> None:
+        try:
+            from .cli import _auto_tile
+            from .compare import compare_frame
+            from .models import load_model
+            from .upscale import Upscaler
+            from .vram import select_device
+
+            req = self.request
+            device = select_device(prefer_cuda=not req.cpu)
+            self.log.emit(f"Comparing one frame with {req.model.name} on {device}...")
+            model = load_model(req.model, device=device, half=not req.cpu)
+            tile = req.tile or _auto_tile(model.scale, req.overlap)
+            upscaler = Upscaler(
+                model, tile=tile, overlap=req.overlap, device=device,
+                half=not req.cpu, vram_budget=req.vram_budget,
+            )
+            pair = compare_frame(req, upscaler, seconds=self.seconds)
+            self.ready.emit(pair)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            self.log.emit(traceback.format_exc())
+
+
 def _slider(minimum: int, maximum: int, value: int) -> QSlider:
     s = QSlider(Qt.Horizontal)
     s.setRange(minimum, maximum)
@@ -226,8 +270,11 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Enhancer")
-        self.setMinimumSize(900, 560)
-        self.resize(1280, 780)
+        # The floor is what the panels genuinely need: settings scroll plus a
+        # pinned forecast beside the picture, over the progress strip. Claiming
+        # a smaller minimum only means clipping something.
+        self.setMinimumSize(940, 680)
+        self.resize(1320, 840)
         self.setAcceptDrops(True)
 
         self.source: Path | None = None
@@ -239,56 +286,54 @@ class MainWindow(QMainWindow):
         self.active_task: Task | None = None
         self._scan_type = "progressive"
         self._image_size: tuple[int, int] | None = None
+        self.compare_thread: QThread | None = None
+        self.compare_worker: CompareWorker | None = None
+        self.theme_mode = theme.load_mode()
 
-        # Landscape: settings in two columns side by side, progress spanning the
-        # full width beneath. The splitter lets the columns be rebalanced, and
-        # every group expands with the window rather than sitting at a fixed size.
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(theme.GAP_WIDE)
-        left_layout.addWidget(self._source_group())
-        left_layout.addWidget(self._model_group())
-        left_layout.addWidget(self._output_group())
-        left_layout.addStretch(1)
-
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(theme.GAP_WIDE)
-        right_layout.addWidget(self._texture_group())
-        right_layout.addWidget(self._fps_group())
-        right_layout.addWidget(self._queue_group())
-        right_layout.addStretch(1)
+        # The picture takes the main area; the controls sit beside it.
+        #
+        # Everything the theme aims at — restraint, no colour for its own sake,
+        # nothing competing with the image — was written for a window that had
+        # no image in it. Thirty controls in two scrolling columns is a wall
+        # however carefully it is spaced, and the one thing the user actually
+        # needs to look at, the frame, was not on screen at all.
+        settings = self._settings_panel()
+        viewer = self._viewer_panel()
 
         self.columns = QSplitter(Qt.Horizontal)
-        self.columns.addWidget(left)
-        self.columns.addWidget(right)
+        self.columns.addWidget(viewer)
+        self.columns.addWidget(settings)
         self.columns.setStretchFactor(0, 3)
         self.columns.setStretchFactor(1, 2)
         self.columns.setChildrenCollapsible(False)
+        # Air between the panes. Without it the viewer's zoom buttons and the
+        # settings tab bar sit on the same line a few pixels apart and read as
+        # one toolbar belonging to neither.
+        self.columns.setHandleWidth(theme.GAP_WIDE)
+        viewer.setMinimumWidth(300)
+        settings.setMinimumWidth(340)
+        self.columns.setSizes([700, 540])
 
-        # Without this the settings crush into each other and overlap as soon
-        # as the window is shorter than their natural height — groups lose
-        # their padding, then their borders touch, then content spills across
-        # them. Scrolling keeps every group at its proper size instead.
-        self.scroll = QScrollArea()
-        self.scroll.setWidget(self.columns)
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QScrollArea.NoFrame)
-        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        left.setMinimumWidth(320)
-        right.setMinimumWidth(300)
-        self.columns.setSizes([720, 520])
+        # Progress and the log get whatever height the user gives them, and no
+        # more. Fixed, they took nearly a third of the window to show one bar
+        # and an empty box, squeezing the picture — which is the one thing
+        # worth looking at — into a strip.
+        strip = self._status_strip()
+        self.rows = QSplitter(Qt.Vertical)
+        self.rows.addWidget(self.columns)
+        self.rows.addWidget(strip)
+        self.rows.setStretchFactor(0, 1)
+        self.rows.setStretchFactor(1, 0)
+        self.rows.setChildrenCollapsible(False)
+        self.rows.setHandleWidth(theme.GAP)
+        self.rows.setSizes([580, 200])
 
         root = QWidget()
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(theme.GAP_WIDE, theme.GAP_WIDE, theme.GAP_WIDE, theme.GAP_WIDE)
-        layout.setSpacing(theme.GAP_WIDE)
-        layout.addWidget(self.scroll, 1)
-        layout.addWidget(self._forecast_group())
-        layout.addLayout(self._actions())
-        layout.addWidget(self._progress_group(), 0)
+        layout.setContentsMargins(theme.GAP_WIDE, theme.GAP, theme.GAP_WIDE, theme.GAP)
+        layout.setSpacing(theme.GAP)
+        layout.addLayout(self._header())
+        layout.addWidget(self.rows, 1)
         self.setCentralWidget(root)
 
         self._watch_settings()
@@ -301,6 +346,159 @@ class MainWindow(QMainWindow):
 
     # --- construction -------------------------------------------------------
 
+    def _header(self) -> QHBoxLayout:
+        """One line naming what is loaded, and the two window-level actions."""
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(theme.GAP_TIGHT)
+
+        self.title_label = QLabel("Drop a video or image here")
+        self.title_label.setObjectName("headline")
+        row.addWidget(self.title_label, 1)
+
+        self.theme_button = QToolButton()
+        self.theme_button.setObjectName("segment")
+        self.theme_button.setToolTip(HELP["theme_toggle"])
+        self.theme_button.clicked.connect(self._toggle_theme)
+        self._sync_theme_button()
+        row.addWidget(self.theme_button)
+
+        self.guide_button = QPushButton("Guide")
+        self.guide_button.setToolTip(HELP["guide_button"])
+        self.guide_button.clicked.connect(self._open_guide)
+        row.addWidget(self.guide_button)
+        return row
+
+    def _viewer_panel(self) -> QWidget:
+        """Before and after for a single frame, with the controls that drive it."""
+        from .viewer import CompareView
+
+        panel = QWidget()
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(theme.GAP_TIGHT)
+
+        self.view = CompareView()
+        self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        v.addWidget(self.view, 1)
+
+        # Which moment to test. A face in even light shows texture loss; a wide
+        # shot or a dark scene hides exactly what this view exists to catch.
+        row = QHBoxLayout()
+        row.setSpacing(theme.GAP_TIGHT)
+        row.addWidget(field_label("Frame at"))
+        self.compare_time = QDoubleSpinBox()
+        self.compare_time.setDecimals(1)
+        self.compare_time.setSuffix(" s")
+        self.compare_time.setRange(0.0, 0.0)
+        self.compare_time.setSingleStep(1.0)
+        self.compare_time.setToolTip(HELP["compare_time"])
+        self.compare_time.setEnabled(False)
+        row.addWidget(self.compare_time)
+        row.addWidget(help_button("compare_time"))
+
+        self.compare_button = QPushButton("Compare this frame")
+        self.compare_button.setObjectName("primary")
+        self.compare_button.setToolTip(HELP["compare_button"])
+        self.compare_button.setEnabled(False)
+        self.compare_button.clicked.connect(self._run_compare)
+        row.addWidget(self.compare_button, 1)
+        row.addWidget(help_button("compare_button"))
+        v.addLayout(row)
+        return panel
+
+    def _settings_panel(self) -> QWidget:
+        """Source above, everything else behind tabs, forecast below.
+
+        Tabs rather than one long column because only one group is ever being
+        adjusted at a time, while all six were competing for attention at once.
+        Source and the forecast stay visible in every tab: what is loaded and
+        what will come out are the context for every other decision.
+        """
+        inner = QWidget()
+        v = QVBoxLayout(inner)
+        v.setContentsMargins(0, 0, theme.GAP_TIGHT, 0)
+        v.setSpacing(theme.GAP)
+
+        # One group per tab, Source included. Stacking Source above the tabs
+        # left the tab pages roughly a hundred and fifty pixels tall, which put
+        # Degrain, Detail retention and Re-grain — the controls that decide
+        # whether faces come out waxy — below the fold behind a scrollbar.
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.addTab(self._tab(self._source_group()), "Source")
+        self.tabs.addTab(self._tab(self._model_group()), "Model")
+        self.tabs.addTab(self._tab(self._texture_group()), "Texture")
+        self.tabs.addTab(self._tab(self._fps_group()), "Motion")
+        self.tabs.addTab(self._tab(self._output_group()), "Performance")
+        self.tabs.addTab(self._tab(self._queue_group()), "Queue")
+        v.addWidget(self.tabs)
+        v.addStretch(1)
+
+        # Without this the groups crush into each other and overlap as soon as
+        # the window is shorter than their natural height — they lose their
+        # padding, then their borders touch, then content spills across them.
+        self.scroll = QScrollArea()
+        self.scroll.setWidget(inner)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QScrollArea.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        # The forecast sits outside the scroll area deliberately. Its whole
+        # purpose is to be read immediately before pressing Render, and it
+        # cannot do that from below the fold.
+        panel = QWidget()
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(theme.GAP)
+        # A floor, or pinning the forecast starves the scroll area down to a
+        # sliver showing one clipped label.
+        self.scroll.setMinimumHeight(300)
+        outer.addWidget(self.scroll, 1)
+        outer.addWidget(self._forecast_group(), 0)
+        return panel
+
+    def _tab(self, *groups: QWidget) -> QWidget:
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, theme.GAP, 0, 0)
+        v.setSpacing(theme.GAP_WIDE)
+        for group in groups:
+            v.addWidget(group)
+        v.addStretch(1)
+        return page
+
+    def _status_strip(self) -> QWidget:
+        """Progress, the render actions and the log, in one block."""
+        strip = QWidget()
+        v = QVBoxLayout(strip)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(theme.GAP_TIGHT)
+        v.addWidget(self._progress_group(), 1)
+        v.addLayout(self._actions())
+        # Enough for the bar, the status line, two lines of log and the
+        # action row. Below this the log is clipped mid-line, which looks
+        # broken rather than compact.
+        strip.setMinimumHeight(196)
+        return strip
+
+    def _sync_theme_button(self) -> None:
+        dark = theme.resolve(QApplication.instance(), self.theme_mode) is theme.DARK
+        self.theme_button.setText("Light" if dark else "Dark")
+
+    def _toggle_theme(self) -> None:
+        """Flip to the opposite of what is showing, and remember it.
+
+        Deliberately two-state rather than cycling through Follow system: a
+        toggle that sometimes appears to do nothing, because the system
+        setting already matched, reads as broken.
+        """
+        app = QApplication.instance()
+        dark = theme.resolve(app, self.theme_mode) is theme.DARK
+        self.theme_mode = theme.Mode.LIGHT if dark else theme.Mode.DARK
+        theme.apply(app, self.theme_mode)
+        self._sync_theme_button()
+
     def _source_group(self) -> QGroupBox:
         box = QGroupBox("Source")
         v = QVBoxLayout(box)
@@ -310,13 +508,21 @@ class MainWindow(QMainWindow):
         self.drop_label.setAlignment(Qt.AlignCenter)
         self.drop_label.setWordWrap(True)
         self.drop_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.drop_label.setMinimumHeight(64)
+        self.drop_label.setMinimumHeight(44)
         self.drop_label.setObjectName("dropzone")
-        v.addWidget(with_help(self.drop_label, "source", top=True))
 
+        # Browse sits beside the drop target rather than under it. The header
+        # already names the loaded file, so a tall box repeating that name was
+        # spending sixty pixels of the settings column to say nothing.
         browse = QPushButton("Browse...")
         browse.clicked.connect(self._browse_source)
-        v.addWidget(browse)
+        picker = QHBoxLayout()
+        picker.setContentsMargins(0, 0, 0, 0)
+        picker.setSpacing(theme.GAP_TIGHT)
+        picker.addWidget(self.drop_label, 1)
+        picker.addWidget(browse, 0)
+        picker.addWidget(help_button("source"), 0, Qt.AlignTop)
+        v.addLayout(picker)
 
         self.analysis = QLabel("No source loaded.")
         self.analysis.setWordWrap(True)
@@ -663,9 +869,6 @@ class MainWindow(QMainWindow):
     def _actions(self) -> QHBoxLayout:
         row = QHBoxLayout()
         row.setSpacing(theme.GAP_TIGHT)
-        self.guide_button = QPushButton("Guide")
-        self.guide_button.setToolTip(HELP["guide_button"])
-        self.guide_button.clicked.connect(self._open_guide)
         self.preview_button = QPushButton(f"Preview {PREVIEW_SECONDS}s")
         self.preview_button.setToolTip(HELP["preview_button"])
         self.preview_button.clicked.connect(lambda: self._start(preview=True))
@@ -678,13 +881,12 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel)
 
-        # Guide sits apart on the left; the three actions group on the right in
-        # the order they are used. Every button carries its own tooltip, so no
-        # separate markers here — interleaving them made the row unreadable.
+        # The three actions group on the right in the order they are used.
+        # Every button carries its own tooltip, so no separate markers here —
+        # interleaving them made the row unreadable.
         for button in (self.preview_button, self.render_button, self.cancel_button):
             button.setMinimumWidth(110)
 
-        row.addWidget(self.guide_button)
         row.addStretch(1)
         row.addWidget(self.preview_button)
         row.addWidget(self.render_button)
@@ -694,7 +896,7 @@ class MainWindow(QMainWindow):
     def _progress_group(self) -> QGroupBox:
         box = QGroupBox("Progress")
         v = QVBoxLayout(box)
-        v.setSpacing(theme.GAP)
+        v.setSpacing(theme.GAP_TIGHT)
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
         self.bar = QProgressBar()
@@ -709,9 +911,10 @@ class MainWindow(QMainWindow):
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(500)
-        self.log_view.setMinimumHeight(70)
+        self.log_view.setMinimumHeight(44)
         # Capped, or it grows without limit and squeezes the settings out
-        # of the window when the window is short.
+        # of the window when the window is short. The strip it sits in is a
+        # splitter pane, so anyone who wants a taller log can drag for it.
         self.log_view.setMaximumHeight(110)
         v.addWidget(self.log_view)
         box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
@@ -842,7 +1045,10 @@ class MainWindow(QMainWindow):
 
         self.source = path
         self.drop_label.setText(path.name)
+        self.title_label.setText(path.name)
         self.analysis.setText("Analysing...")
+        self.view.clear()
+        self.compare_button.setEnabled(True)
         QApplication.processEvents()
 
         if is_image(path):
@@ -872,6 +1078,9 @@ class MainWindow(QMainWindow):
             f"grain {grain:.2f}, blockiness {blockiness:.2f}",
         ]
         self._scan_type = scan.value
+        duration = p.frame_count / p.fps if p.fps > 0 else 0.0
+        self.compare_time.setRange(0.0, max(0.0, duration - 0.1))
+        self.compare_time.setEnabled(duration > 0)
         if scan.value == "telecined":
             lines.append(
                 "Film carried as interlaced. Inverse telecine will be applied; "
@@ -912,6 +1121,8 @@ class MainWindow(QMainWindow):
         self.fps_mode.setCurrentText("Off")
         self.fps_mode.setEnabled(False)
         self.preview_button.setEnabled(False)
+        self.compare_time.setRange(0.0, 0.0)
+        self.compare_time.setEnabled(False)
 
         if self.output_label.text().startswith("("):
             self.output_label.setText(str(path.with_name(path.stem + "_enhanced" + path.suffix)))
@@ -985,6 +1196,53 @@ class MainWindow(QMainWindow):
             self._run_task(task)
         else:
             self._append(f"Queued {task.name} — will start when the current job ends.")
+
+    # --- single-frame comparison --------------------------------------------
+
+    def _run_compare(self) -> None:
+        """Put one frame through the current settings and show it beside the source."""
+        if self.compare_thread is not None:
+            return
+        request = self._build_request(preview=False)
+        if request is None:
+            return
+
+        self.compare_button.setEnabled(False)
+        self.compare_button.setText("Comparing...")
+
+        self.compare_thread = QThread(self)
+        self.compare_worker = CompareWorker(request, self.compare_time.value())
+        self.compare_worker.moveToThread(self.compare_thread)
+        self.compare_thread.started.connect(self.compare_worker.run)
+        self.compare_worker.log.connect(self._append)
+        self.compare_worker.ready.connect(self._on_compare_ready)
+        self.compare_worker.failed.connect(self._on_compare_failed)
+        self.compare_thread.start()
+
+    def _on_compare_ready(self, pair) -> None:
+        self.view.set_pair(pair.before, pair.after)
+        w, h = pair.source_size
+        after_h, after_w = pair.after.shape[:2]
+        self._append(
+            f"Compared {w}x{h} against {after_w}x{after_h} at {pair.seconds:.1f}s "
+            f"(frame {pair.frame_index})."
+        )
+        self._end_compare()
+
+    def _on_compare_failed(self, message: str) -> None:
+        self._append(f"Comparison failed: {message}")
+        QMessageBox.warning(self, "Could not compare", message)
+        self._end_compare()
+
+    def _end_compare(self) -> None:
+        if self.compare_thread is not None:
+            self.compare_thread.quit()
+            self.compare_thread.wait()
+            self.compare_thread.deleteLater()
+        self.compare_thread = None
+        self.compare_worker = None
+        self.compare_button.setText("Compare this frame")
+        self.compare_button.setEnabled(self.source is not None)
 
     def _run_task(self, task: Task) -> None:
         request = task.request
@@ -1110,6 +1368,29 @@ class MainWindow(QMainWindow):
 
     def _append(self, text: str) -> None:
         self.log_view.appendPlainText(text)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        """Stop the background threads before Qt tears their objects down.
+
+        A QThread deleted while still running aborts the process, so closing
+        the window mid-comparison — or mid-render — would take the application
+        down with it rather than shutting it cleanly. A render that is stopped
+        this way resumes from its journal on the next run; a comparison writes
+        nothing and is simply abandoned.
+        """
+        for thread, worker in (
+            (self.compare_thread, self.compare_worker),
+            (self.thread, self.worker),
+        ):
+            if thread is None:
+                continue
+            if worker is not None and hasattr(worker, "cancel"):
+                worker.cancel()
+            thread.quit()
+            thread.wait()
+        self.compare_thread = self.thread = None
+        self.compare_worker = self.worker = None
+        super().closeEvent(event)
 
     def bring_to_front(self) -> None:
         """Raise and focus, for when the shortcut is used a second time."""

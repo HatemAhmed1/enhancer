@@ -17,6 +17,8 @@ REQUIRED_KEYS = [
     "queue", "queue_start", "queue_stop", "queue_remove", "queue_clear",
     "forecast",
     "guide_button",
+    "compare_button", "compare_time", "compare_mode", "compare_zoom",
+    "theme_toggle",
 ]
 
 
@@ -33,10 +35,12 @@ NEEDS_DETAIL = [
     "output", "segment_frames", "vram_budget", "cpu",
     "preview_button", "render_button", "progress",
     "queue", "queue_stop", "queue_remove", "forecast",
+    "compare_button", "compare_time", "compare_mode", "compare_zoom",
 ]
 
 # Plain actions: complete in a line or two, and padding them would be worse.
-SIMPLE = ["rescan", "guide_button", "cancel_button", "queue_start", "queue_clear"]
+SIMPLE = ["rescan", "guide_button", "cancel_button", "queue_start", "queue_clear",
+          "theme_toggle"]
 
 
 @pytest.mark.parametrize("key", REQUIRED_KEYS)

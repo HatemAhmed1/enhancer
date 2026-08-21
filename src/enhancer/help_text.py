@@ -169,6 +169,35 @@ HELP: dict[str, str] = {
         "as a guide; once a render starts, the live speed readout is real."
     ),
     "guide_button": "Open a page explaining every setting.",
+    "compare_button": (
+        "Run one frame through the current settings and show it against the "
+        "original.\n\n"
+        "Takes about a second, against hours for a full render. Use it to "
+        "check skin and fabric texture before committing: if faces look waxy "
+        "here, they will look waxy for the whole film.\n\n"
+        "The original is enlarged to the same size as the result, so you are "
+        "comparing quality rather than size."
+    ),
+    "compare_time": (
+        "Which moment of the source to test.\n\n"
+        "Pick a close-up of a face in even light. Wide shots and dark scenes "
+        "hide exactly the problems this view exists to catch."
+    ),
+    "compare_mode": (
+        "How the two frames are shown.\n\n"
+        "Swipe drags a divider across one image. Split places them side by "
+        "side. Toggle flips between them in place — the most sensitive of the "
+        "three, because the eye notices change more readily than difference."
+    ),
+    "compare_zoom": (
+        "Magnification. Both frames zoom and pan together.\n\n"
+        "Judge texture at 100% or above. Fitted to the window, a waxy face and "
+        "a detailed one look identical."
+    ),
+    "theme_toggle": (
+        "Switch between the light and dark palette.\n\n"
+        "Starts on the Windows setting and remembers your choice."
+    ),
 }
 
 
@@ -230,6 +259,12 @@ GUIDE_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
         ("Model", "model"),
         ("Rescan models", "rescan"),
     ]),
+    ("Checking before you commit", [
+        ("Compare this frame", "compare_button"),
+        ("Frame at", "compare_time"),
+        ("View mode", "compare_mode"),
+        ("Zoom", "compare_zoom"),
+    ]),
     ("Skin texture", [
         ("Degrain", "degrain"),
         ("Detail retention", "detail"),
@@ -261,6 +296,7 @@ GUIDE_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
         ("Clear finished", "queue_clear"),
         ("What you will get", "forecast"),
         ("Guide", "guide_button"),
+        ("Light or dark", "theme_toggle"),
     ]),
 ]
 
