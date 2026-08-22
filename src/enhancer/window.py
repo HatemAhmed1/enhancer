@@ -1197,6 +1197,10 @@ class MainWindow(QMainWindow):
         self.title_label.setText(path.name)
         self.analysis.setText("Analysing...")
         self.view.clear()
+        # Detach whatever result was attached to the previous source. Left
+        # alone, Play would stream the old film's original against the old
+        # film's render while the window named the new one.
+        self._stop_playback()
         self.compare_button.setEnabled(True)
         QApplication.processEvents()
 
@@ -1448,19 +1452,24 @@ class MainWindow(QMainWindow):
 
     def _stop_playback(self) -> None:
         self._pause()
-        if self.play_thread is None:
-            return
-        # Quit and wait FIRST. shutdown() closes the ffmpeg pipes the worker
-        # thread is reading from, so calling it while that thread is still
-        # live is a race against a decode already in progress.
-        self.play_thread.quit()
-        self.play_thread.wait()
-        if self.play_worker is not None:
-            self.play_worker.shutdown()
-        self.play_thread.deleteLater()
+        if self.play_thread is not None:
+            # Quit and wait FIRST. shutdown() closes the ffmpeg pipes the
+            # worker thread is reading from, so calling it while that thread
+            # is still live races a decode already in progress.
+            self.play_thread.quit()
+            self.play_thread.wait()
+            if self.play_worker is not None:
+                self.play_worker.shutdown()
+            self.play_thread.deleteLater()
         self.play_thread = None
         self.play_worker = None
         self._frame_in_flight = False
+        self.comparison = None
+        self.compare_with_button.setText("Compare with...")
+        self.play_button.setEnabled(False)
+        self.position.setEnabled(False)
+        self.position.setRange(0, 0)
+        self.time_label.setText("--:-- / --:--")
 
     # --- single-frame comparison --------------------------------------------
 
@@ -1639,6 +1648,15 @@ class MainWindow(QMainWindow):
         self.render_button.setEnabled(not running)
         self.preview_button.setEnabled(not running)
         self.cancel_button.setEnabled(running)
+        # Comparing loads a second copy of the model onto the same card. On
+        # Windows the driver oversubscribes graphics memory silently rather
+        # than failing, so this would not crash — it would quietly slow a
+        # render that has hours left to run, with nothing on screen to say why.
+        self.compare_button.setEnabled(not running and self.source is not None)
+        self.compare_button.setToolTip(
+            "Not while a render is using the graphics card."
+            if running else HELP["compare_button"]
+        )
 
     def _append(self, text: str) -> None:
         self.log_view.appendPlainText(text)

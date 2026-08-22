@@ -677,3 +677,37 @@ def test_closing_mid_playback_stops_the_stream(window):
 
     assert window.play_thread is None
     assert not thread.isRunning()
+
+
+def test_a_new_source_detaches_the_old_result(window, tmp_path):
+    """Otherwise Play streams the previous film under the new film's name."""
+    from PIL import Image
+
+    window.comparison = tmp_path / "old_render.mkv"
+    window.compare_with_button.setText("old_render.mkv")
+    window.play_button.setEnabled(True)
+
+    src = tmp_path / "next.png"
+    Image.new("RGB", (32, 32), (1, 2, 3)).save(src)
+    window._load_source(src)
+
+    assert window.comparison is None
+    assert not window.play_button.isEnabled()
+    assert window.compare_with_button.text() == "Compare with..."
+
+
+def test_comparing_is_blocked_while_a_render_holds_the_card(window, tmp_path):
+    """A second copy of the model on a 6 GB card silently slows the render."""
+    from PIL import Image
+
+    src = tmp_path / "s.png"
+    Image.new("RGB", (32, 32), (1, 2, 3)).save(src)
+    window._load_source(src)
+    assert window.compare_button.isEnabled()
+
+    window._set_running(True)
+    assert not window.compare_button.isEnabled()
+    assert "graphics card" in window.compare_button.toolTip()
+
+    window._set_running(False)
+    assert window.compare_button.isEnabled()
