@@ -52,7 +52,7 @@ from .help_text import (
     model_rank,
     model_scale as scale_from_name,
 )
-from .jobs import SettingsMismatch
+from .jobs import SettingsMismatch, SourceMismatch
 from .models import scan_custom_dir
 from .paths import custom_models_dir, ensure_models_dirs
 from .queue import RenderQueue, Task, TaskState
@@ -134,7 +134,7 @@ class Worker(QObject):
     log = Signal(str)
     finished = Signal(str)
     failed = Signal(str)
-    settings_changed = Signal()
+    settings_changed = Signal(bool)  # True when the SOURCE differs
 
     def __init__(self, request: RenderRequest) -> None:
         super().__init__()
@@ -179,8 +179,12 @@ class Worker(QObject):
             out = self.job.run(on_progress=self.progress.emit)
             self.log.emit(f"CPU fallbacks: {upscaler.cpu_fallback_count}")
             self.finished.emit(str(out))
+        except SourceMismatch:
+            # A different film behind the same output name. Reported apart
+            # from a settings change: the risk and the remedy both differ.
+            self.settings_changed.emit(True)
         except SettingsMismatch:
-            self.settings_changed.emit()
+            self.settings_changed.emit(False)
         except CancelledError:
             self.failed.emit("Cancelled. Re-run to resume from where it stopped.")
         except Exception as exc:  # noqa: BLE001 - surfaced to the user
@@ -1805,7 +1809,7 @@ class MainWindow(QMainWindow):
         self.worker.settings_changed.connect(self._on_settings_changed)
         self.thread.start()
 
-    def _on_settings_changed(self) -> None:
+    def _on_settings_changed(self, source_differs: bool = False) -> None:
         """Offer a way forward instead of a dead end.
 
         Refusing to resume is right — splicing footage processed two different
@@ -1828,21 +1832,43 @@ class MainWindow(QMainWindow):
             self._start_next()
             return
 
+        if source_differs:
+            title = "That unfinished render is of something else"
+            message = (
+                "This output already has a part-finished render, but it was "
+                "made from a different file — or from this one before it was "
+                "replaced.\n\n"
+                "Continuing it would splice the two together and deliver the "
+                "wrong footage under the right name.\n\n"
+                "Start again from the beginning with the file you have now?\n"
+                "(The part-finished render is discarded.)"
+            )
+        else:
+            title = "Settings changed"
+            message = (
+                "This output already has a part-finished render made with "
+                "different settings.\n\n"
+                "Continuing it would leave a visible seam partway through the "
+                "video, so it cannot simply carry on.\n\n"
+                "Start again from the beginning with your current settings?\n"
+                "(The part-finished render is discarded.)"
+            )
+
         choice = QMessageBox.question(
-            self,
-            "Settings changed",
-            "This output already has a part-finished render made with "
-            "different settings.\n\n"
-            "Continuing it would leave a visible seam partway through the "
-            "video, so it cannot simply carry on.\n\n"
-            "Start again from the beginning with your current settings?\n"
-            "(The part-finished render is discarded.)",
+            self, title, message,
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
         )
         if choice != QMessageBox.Yes:
-            self.status.setText("Stopped — settings differ from the unfinished render.")
-            self._append("Restore the previous settings to continue it instead.")
+            if source_differs:
+                self.status.setText("Stopped — that unfinished render is of another file.")
+                self._append(
+                    "Choose a different output name, or discard the unfinished "
+                    "render, to go on."
+                )
+            else:
+                self.status.setText("Stopped — settings differ from the unfinished render.")
+                self._append("Restore the previous settings to continue it instead.")
             self._start_next()
             return
 

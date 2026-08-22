@@ -4,7 +4,7 @@ Local GPU video and image upscaler, tuned for restoring Indian cinema footage �
 
 Runs entirely offline. No cloud services, no API keys, no telemetry.
 
-**Status:** working end to end — engine, restoration, frame interpolation, resumable rendering, and a desktop window with before/after comparison. 828 tests. See [Roadmap](#roadmap) for what remains.
+**Status:** working end to end — engine, restoration, frame interpolation, resumable rendering, and a desktop window with before/after comparison. 1031 tests. See [Roadmap](#roadmap) for what remains.
 
 ---
 
@@ -20,9 +20,11 @@ Runs entirely offline. No cloud services, no API keys, no telemetry.
 - **Resumable** — renders are written as independently complete segments, so an interruption costs at most one segment, not the whole job
 - **Streaming pipeline** — frames move through ffmpeg pipes and never touch disk, avoiding the three-pass PNG cache most tools use
 - **OOM-proof** — adaptive tiling shrinks on memory pressure and falls back to CPU per frame rather than crashing, including on Windows, where the driver oversubscribes silently instead of raising
+- **Your files are safe** — a render refuses to write over its own source, including when two paths differ only in capitalisation, and never resumes an unfinished job that belongs to a different file
 - **Any model** — drop any [OpenModelDB](https://openmodeldb.info/) `.pth` into `models/custom/` and it appears automatically; architecture is auto-detected
 - **Colour-correct** — BT.601/709 primaries, transfer, matrix, and sample aspect ratio are preserved end to end
-- **10-bit NVENC output** with audio, subtitle, and chapter passthrough
+- **Runs on what you have** — the graphics card, encoder and memory ladder are detected, and time estimates calibrate themselves from your own finished renders rather than assuming the machine this was built on
+- **10-bit output** with audio, subtitle, and chapter passthrough, through whichever hardware encoder the machine has, or `libx265` when it has none
 - **Images and video** — `.png`, `.jpg`, `.webp`, `.bmp`, `.tif` stills alongside `.mp4`, `.mkv`, `.mov`, `.avi`, `.webm`, with alpha preserved
 - **YouTube source** — search and download directly, no API key required
 
@@ -30,21 +32,21 @@ Runs entirely offline. No cloud services, no API keys, no telemetry.
 
 ## Requirements
 
-Windows only at present.
-
 | | |
 |---|---|
-| OS | Windows 10/11 |
-| GPU | NVIDIA, 6 GB VRAM or more (CUDA 12.x driver) |
+| OS | Windows 10/11. macOS and Linux are supported in code but not tested here |
+| GPU | Optional. NVIDIA (CUDA), Apple Silicon and Intel Arc are used when present; otherwise the processor, which works but is tens of times slower |
 | Python | 3.12 — **not** 3.13+, which has no PyTorch wheels |
 | GUI | PySide6 (optional; the CLI works without it) |
-| ffmpeg | on `PATH`, with NVENC support |
+| ffmpeg | on `PATH`. Any build — a hardware encoder is used when there is one, and `libx265` otherwise |
 
-Verify ffmpeg:
+Check everything at once, and get the command that installs whatever is missing:
 
 ```powershell
-ffmpeg -version
+.venv\Scripts\python.exe -m enhancer.cli check
 ```
+
+It reports the processor, memory, graphics card and the encoder chosen for it, and exits non-zero when something essential is absent. The desktop window shows the same under **System**, and says so by itself at startup if a render could not run.
 
 ---
 
@@ -62,11 +64,21 @@ winget install Python.Python.3.12
 py -3.12 -m venv .venv
 ```
 
-**3. Install PyTorch with CUDA**
+**3. Install PyTorch**
+
+With an NVIDIA card:
 
 ```powershell
 .venv\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 ```
+
+On Apple Silicon, or with no graphics card at all, the plain build is the right one:
+
+```powershell
+.venv\Scripts\python.exe -m pip install torch torchvision
+```
+
+Take care not to install the plain build on an NVIDIA machine by accident. It is the default, it works, and it silently runs everything on the processor at a fraction of the speed. Step 5 catches that.
 
 **4. Install remaining dependencies**
 
@@ -74,13 +86,13 @@ py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install -e .
 ```
 
-**5. Confirm the GPU is visible**
+**5. Confirm what will actually be used**
 
 ```powershell
-.venv\Scripts\python.exe -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+.venv\Scripts\python.exe -m enhancer.cli check
 ```
 
-Expected: `True NVIDIA GeForce RTX 3060 Laptop GPU` (or your card). If this prints `False`, resolve the CUDA install before continuing.
+This names the processor, memory, graphics card and the encoder chosen for it, and lists anything missing with the command that installs it. If it reports no graphics acceleration on a machine that has a card, the processor-only PyTorch went in — go back to step 3.
 
 **6. Add a model**
 
@@ -110,7 +122,7 @@ Optional. Produces `dist\Enhancer\Enhancer.exe`, which runs without Python insta
 
 Takes 10–20 minutes and produces roughly 5 GB, nearly all of it PyTorch and the CUDA runtime — the graphics code is the application, so there is no trimming it meaningfully.
 
-It is a folder, not a single file, deliberately: a one-file build of this size unpacks itself to a temporary directory on every launch and takes half a minute to appear. Copy the whole `dist\Enhancer` folder to move it. Models are read from `models\custom` and `models\rife` beside the executable.
+It is a folder, not a single file, deliberately: a one-file build of this size unpacks itself to a temporary directory on every launch and takes half a minute to appear. Copy the whole `dist\Enhancer` folder to move it. Models are read from `models\custom` and `models\rife` beside the executable, wherever it is launched from, and a `models` folder in the current directory takes precedence so a project can keep its own.
 
 ffmpeg is still required on `PATH`; it is not bundled.
 
@@ -141,6 +153,10 @@ Two faults only appear in motion and are invisible in a still: grain that pulses
 Playback decodes at the size the pane shows, which is what keeps a 4K comparison watchable — the full picture is 24.9 MB a frame, and sixty of those a second is more than a pipe will carry. Zoom is therefore not the tool here: to inspect texture, pause and use *Compare this frame*, which always works at full resolution.
 
 Cancel is safe: it stops after the current frame, keeps every completed segment, and re-running resumes.
+
+**Your files are not overwritten by accident.** A render refuses to start when the output would be the same file as the source — including when the two differ only in capitalisation, which on Windows is the same file and which ffmpeg's own check does not catch. An existing result is kept too: replacing one needs `--force`, unless the unfinished render beside it belongs to this job, which is an ordinary resume.
+
+An unfinished render is only continued when it came from the same file. Re-render after replacing a source with a better rip and it starts again rather than splicing the old footage into the new.
 
 **List available models**
 
@@ -187,6 +203,7 @@ Restoration is on by default. Scan correction is chosen automatically from the d
 | `--regrain` | 0.6 | Adds midtone-weighted film grain after upscaling, with a per-frame seed so it moves like film rather than sitting static |
 | `--deblock` | 0.0 | Compression artifact removal. Raise it for YouTube sources and low-bitrate rips |
 | `--no-restore` | off | Skip all restoration and texture work |
+| `--force`, `-f` | off | Replace an existing output file. Not needed to resume an unfinished render, which is recognised by its own journal |
 
 Restoration costs roughly 35% throughput. Use `--no-restore` for a fast preview, then render properly.
 

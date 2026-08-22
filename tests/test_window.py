@@ -993,3 +993,41 @@ def test_a_models_folder_in_the_working_directory_still_wins(tmp_path, monkeypat
     (tmp_path / "models" / "custom").mkdir(parents=True)
     monkeypatch.chdir(tmp_path)
     assert paths.custom_models_dir() == tmp_path / "models" / "custom"
+
+
+def test_a_different_film_is_not_reported_as_changed_settings(window, tmp_path, monkeypatch):
+    """The remedy and the risk differ, so the wording must too.
+
+    A settings mismatch risks a seam. A source mismatch would deliver another
+    film's footage under this film's name, which is worse and needs saying.
+    """
+    from PySide6.QtWidgets import QMessageBox
+
+    from enhancer.queue import Task
+    from enhancer.requests import RenderRequest
+
+    asked = []
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        lambda _p, title, text, *a, **k: asked.append((title, text)) or QMessageBox.No,
+    )
+    request = RenderRequest(
+        model=tmp_path / "m.pth", source=tmp_path / "s.mkv", output=tmp_path / "o.mkv",
+    )
+    task = window.queue.add(request)
+    window.queue.start(task)
+    window.active_task = task
+    window.worker = type("W", (), {"request": request})()
+
+    window._on_settings_changed(source_differs=True)
+    assert asked, "said nothing at all"
+    title, text = asked[0]
+    assert "settings" not in title.lower(), f"wrong wording: {title!r}"
+    assert "different file" in text or "replaced" in text
+
+
+def test_the_source_mismatch_is_still_a_settings_mismatch():
+    """The worker catches the narrower one first; order matters."""
+    from enhancer.jobs import SettingsMismatch, SourceMismatch
+
+    assert issubclass(SourceMismatch, SettingsMismatch)
