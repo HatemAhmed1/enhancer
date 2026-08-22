@@ -4,7 +4,7 @@ Local GPU video and image upscaler, tuned for restoring Indian cinema footage �
 
 Runs entirely offline. No cloud services, no API keys, no telemetry.
 
-**Status:** working end to end — engine, restoration, frame interpolation, resumable rendering, and a desktop window with before/after comparison. 813 tests. See [Roadmap](#roadmap) for what remains.
+**Status:** working end to end — engine, restoration, frame interpolation, resumable rendering, and a desktop window with before/after comparison. 828 tests. See [Roadmap](#roadmap) for what remains.
 
 ---
 
@@ -126,7 +126,19 @@ ffmpeg is still required on `PATH`; it is not bundled.
 
 Drop a video in and it reports resolution, frame rate, colour space, scan type, grain and compression artifacts, then recommends a pre-pass. Sliders for degrain, detail retention, re-grain and deblock; frame-rate conversion; live progress with fps and ETA; cancel.
 
+**Check one frame first.** *Compare this frame* puts a single frame through the settings currently set and shows it against the original, in about a second. Pick a lit close-up rather than a wide shot: waxy skin is invisible in a crowd scene and obvious on a face.
+
+Drag the divider across the picture, or switch to *Split* for side by side, or *Toggle* to flip between the two in place — flipping is the most sensitive of the three, because the eye catches change more readily than difference. Judge at 100% or above; fitted to the window, a waxy face and a detailed one look the same.
+
+The original is enlarged to the result's size before either is drawn, so what you see is the difference in quality and not the difference in size. That matters: a 1080p original shown next to a 4K result flatters any model for free.
+
 **Preview before committing.** The *Preview 10s* button renders ten seconds through the identical pipeline. A 1080p→4K feature is ~17 hours, so the expensive mistake is not a slow render but a slow render with the wrong settings. Ten seconds takes under a minute and answers the same question.
+
+**Then watch it move.** When a preview or render finishes it attaches itself to the transport under the picture; *Compare with* opens any earlier result instead. Press *Play* and both clips run in step under the divider.
+
+Two faults only appear in motion and are invisible in a still: grain that pulses from frame to frame, and skin that slides between detailed and waxy as the light changes. *Loop* is worth using on a difficult shot.
+
+Playback decodes at the size the pane shows, which is what keeps a 4K comparison watchable — the full picture is 24.9 MB a frame, and sixty of those a second is more than a pipe will carry. Zoom is therefore not the tool here: to inspect texture, pause and use *Compare this frame*, which always works at full resolution.
 
 Cancel is safe: it stops after the current frame, keeps every completed segment, and re-running resumes.
 
@@ -283,8 +295,14 @@ src/enhancer/
   playback.py    two streams aligned by time
   viewer.py      swipe, split and toggle comparison widget
   window.py      desktop window
+  gui.py         one render, cancellable, with no Qt in it
+  requests.py    the settings a render depends on
   theme.py       palette, light and dark
   help_text.py   every user-facing explanation
+  splash.py      startup feedback while the libraries load
+  single.py      one instance at a time
+  proc.py        subprocess launch without console windows
+  rife/          vendored RIFE interpolation network
   bench.py       throughput and VRAM measurement
   sources.py     YouTube search and download
   cli.py         command-line entrypoint
