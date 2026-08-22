@@ -16,8 +16,8 @@ from __future__ import annotations
 HELP: dict[str, str] = {
     "source": (
         "The file to enlarge.\n\n"
-        "Video: mp4, mkv, mov, avi, webm\n"
-        "Images: png, jpg, webp — transparency kept\n\n"
+        "Video: mp4, mkv, mov, avi, webm, m4v, ts, wmv\n"
+        "Images: png, jpg, webp, bmp, tif — transparency kept\n\n"
         "Drop it here, or click Browse."
     ),
     "analysis": (
@@ -194,6 +194,29 @@ HELP: dict[str, str] = {
         "Judge texture at 100% or above. Fitted to the window, a waxy face and "
         "a detailed one look identical."
     ),
+    "play_button": (
+        "Play the original and a finished result together, in step.\n\n"
+        "A still frame hides two faults that only appear in motion: grain that "
+        "pulses from frame to frame, and skin that shifts between detailed and "
+        "waxy as the light changes.\n\n"
+        "Needs something already rendered. Run Preview for ten seconds, or "
+        "load any earlier result with Compare with."
+    ),
+    "compare_with": (
+        "The finished file to play against the original.\n\n"
+        "Filled in automatically when a preview or render ends. Point it at an "
+        "older result to judge two sets of settings against each other."
+    ),
+    "position": (
+        "Where you are in the clip. Drag to move both streams together.\n\n"
+        "When the result is a short preview of a long film, only the stretch "
+        "the preview covers can be played."
+    ),
+    "loop": (
+        "Repeat the range instead of stopping at the end.\n\n"
+        "Watching a difficult shot several times over is the most reliable way "
+        "to see whether grain is steady or pulsing."
+    ),
     "theme_toggle": (
         "Switch between the light and dark palette.\n\n"
         "Starts on the Windows setting and remembers your choice."
@@ -264,6 +287,10 @@ GUIDE_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
         ("Frame at", "compare_time"),
         ("View mode", "compare_mode"),
         ("Zoom", "compare_zoom"),
+        ("Play", "play_button"),
+        ("Compare with", "compare_with"),
+        ("Position", "position"),
+        ("Loop", "loop"),
     ]),
     ("Skin texture", [
         ("Degrain", "degrain"),

@@ -18,6 +18,7 @@ REQUIRED_KEYS = [
     "forecast",
     "guide_button",
     "compare_button", "compare_time", "compare_mode", "compare_zoom",
+    "play_button", "compare_with", "position", "loop",
     "theme_toggle",
 ]
 
@@ -36,6 +37,7 @@ NEEDS_DETAIL = [
     "preview_button", "render_button", "progress",
     "queue", "queue_stop", "queue_remove", "forecast",
     "compare_button", "compare_time", "compare_mode", "compare_zoom",
+    "play_button", "compare_with", "position", "loop",
 ]
 
 # Plain actions: complete in a line or two, and padding them would be worse.

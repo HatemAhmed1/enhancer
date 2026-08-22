@@ -6,7 +6,7 @@ import time
 import traceback
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QFontMetrics
 from PySide6.QtWidgets import (
     QApplication,
@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
 from . import theme
 from .analyze import classify_scan, estimate_blockiness, estimate_grain, probe_scan
 from .gui import CancelledError, RenderJob
+from .images import IMAGE_SUFFIXES
 from .help_text import (
     GUIDE_SECTIONS,
     HELP,
@@ -57,7 +58,14 @@ from .queue import RenderQueue, Task, TaskState
 from .requests import RenderRequest
 from .video_io import Decoder, SourceProfile
 
-MEDIA_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".png", ".jpg", ".jpeg"}
+VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".ts", ".wmv"}
+
+# One list, derived from the engine's own. Three had drifted apart: the Browse
+# dialog offered video only, so a still could not be opened through it at all
+# even though the whole image path existed; drag-and-drop took three image
+# types; and images.py handled seven.
+MEDIA_SUFFIXES = VIDEO_SUFFIXES | IMAGE_SUFFIXES
+
 PREVIEW_SECONDS = 10
 
 # A cap deliberately set above any consumer card, so the graphics driver spills
@@ -180,6 +188,90 @@ class CompareWorker(QObject):
             self.log.emit(traceback.format_exc())
 
 
+class PlaybackWorker(QObject):
+    """Owns the paired decoders on a background thread.
+
+    Decoding two frames and rescaling one of them costs tens of milliseconds
+    at 4K, which is most of a frame interval — done on the GUI thread the
+    window would stop responding for the length of the clip.
+    """
+
+    opened = Signal(float, int, float, float)  # fps, frames, start, end
+    frame = Signal(object)
+    ended = Signal()
+    failed = Signal(str)
+
+    def __init__(self, source: Path, output: Path) -> None:
+        super().__init__()
+        self._source = source
+        self._output = output
+        self.player = None
+
+    def open(self) -> None:
+        try:
+            from .playback import ComparePlayer
+
+            self.player = ComparePlayer(self._source, self._output)
+            self.player.open()
+            start, end = self.player.covers
+            self.opened.emit(
+                self.player.fps, self.player.frame_count, start, end
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+    def deliver_next(self) -> None:
+        if self.player is None:
+            return
+        try:
+            pair = self.player.next_pair()
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        if pair is None:
+            self.ended.emit()
+        else:
+            self.frame.emit(pair)
+
+    def seek(self, seconds: float) -> None:
+        if self.player is None:
+            return
+        try:
+            self.player.seek(seconds)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        self.deliver_next()
+
+    def shutdown(self) -> None:
+        if self.player is not None:
+            self.player.close()
+        self.player = None
+
+
+def _clock(seconds: float) -> str:
+    """m:ss, or h:mm:ss once a clip runs past an hour."""
+    seconds = max(0, int(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def source_filter() -> str:
+    """File-dialog filter covering everything the engine can actually open."""
+    def patterns(suffixes: set[str]) -> str:
+        return " ".join(f"*{s}" for s in sorted(suffixes))
+
+    return ";;".join([
+        f"All supported ({patterns(MEDIA_SUFFIXES)})",
+        f"Video ({patterns(VIDEO_SUFFIXES)})",
+        f"Images ({patterns(IMAGE_SUFFIXES)})",
+        "All files (*)",
+    ])
+
+
 def _slider(minimum: int, maximum: int, value: int) -> QSlider:
     s = QSlider(Qt.Horizontal)
     s.setRange(minimum, maximum)
@@ -267,6 +359,13 @@ def field_label(text: str) -> QLabel:
 
 
 class MainWindow(QMainWindow):
+    # Emitted from the GUI thread, received on the playback thread. Signals
+    # rather than direct calls because Qt then queues them across the thread
+    # boundary for us.
+    request_open = Signal()
+    request_frame = Signal()
+    request_seek = Signal(float)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Enhancer")
@@ -288,6 +387,14 @@ class MainWindow(QMainWindow):
         self._image_size: tuple[int, int] | None = None
         self.compare_thread: QThread | None = None
         self.compare_worker: CompareWorker | None = None
+        self.play_thread: QThread | None = None
+        self.play_worker: PlaybackWorker | None = None
+        self.comparison: Path | None = None
+        self._play_fps = 24.0
+        self._play_duration = 0.0
+        self._frame_in_flight = False
+        self.play_timer = QTimer(self)
+        self.play_timer.timeout.connect(self._tick)
         self.theme_mode = theme.load_mode()
 
         # The picture takes the main area; the controls sit beside it.
@@ -405,7 +512,49 @@ class MainWindow(QMainWindow):
         row.addWidget(self.compare_button, 1)
         row.addWidget(help_button("compare_button"))
         v.addLayout(row)
+        v.addLayout(self._transport())
         return panel
+
+    def _transport(self) -> QHBoxLayout:
+        """Playback of a finished result against the original.
+
+        A single frame hides the two faults that only show in motion: grain
+        that pulses between frames, and skin that slides between detailed and
+        waxy as the light changes.
+        """
+        row = QHBoxLayout()
+        row.setSpacing(theme.GAP_TIGHT)
+
+        self.play_button = QPushButton("Play")
+        self.play_button.setToolTip(HELP["play_button"])
+        self.play_button.setEnabled(False)
+        self.play_button.setMinimumWidth(80)
+        self.play_button.clicked.connect(self._toggle_play)
+        row.addWidget(self.play_button)
+        row.addWidget(help_button("play_button"))
+
+        self.position = QSlider(Qt.Horizontal)
+        self.position.setRange(0, 0)
+        self.position.setEnabled(False)
+        self.position.setToolTip(HELP["position"])
+        self.position.sliderReleased.connect(self._seek_to_slider)
+        row.addWidget(self.position, 1)
+
+        self.time_label = QLabel("--:-- / --:--")
+        self.time_label.setObjectName("caption")
+        row.addWidget(self.time_label)
+
+        self.loop_check = QCheckBox("Loop")
+        self.loop_check.setToolTip(HELP["loop"])
+        row.addWidget(self.loop_check)
+        row.addWidget(help_button("loop"))
+
+        self.compare_with_button = QPushButton("Compare with...")
+        self.compare_with_button.setToolTip(HELP["compare_with"])
+        self.compare_with_button.clicked.connect(self._browse_comparison)
+        row.addWidget(self.compare_with_button)
+        row.addWidget(help_button("compare_with"))
+        return row
 
     def _settings_panel(self) -> QWidget:
         """Source above, everything else behind tabs, forecast below.
@@ -1030,7 +1179,7 @@ class MainWindow(QMainWindow):
 
     def _browse_source(self) -> None:
         name, _ = QFileDialog.getOpenFileName(
-            self, "Choose a source", "", "Video (*.mp4 *.mkv *.mov *.avi *.webm)"
+            self, "Choose a source", "", source_filter()
         )
         if name:
             self._load_source(Path(name))
@@ -1197,6 +1346,122 @@ class MainWindow(QMainWindow):
         else:
             self._append(f"Queued {task.name} — will start when the current job ends.")
 
+    # --- playback -----------------------------------------------------------
+
+    def _browse_comparison(self) -> None:
+        name, _ = QFileDialog.getOpenFileName(
+            self, "Choose a finished result", "",
+            f"Video ({' '.join('*' + s for s in sorted(VIDEO_SUFFIXES))});;All files (*)",
+        )
+        if name:
+            self._load_comparison(Path(name))
+
+    def _load_comparison(self, path: Path) -> None:
+        """Attach a finished result to the original for playback."""
+        if self.source is None:
+            return
+        self._stop_playback()
+
+        self.play_thread = QThread(self)
+        self.play_worker = PlaybackWorker(self.source, path)
+        self.play_worker.moveToThread(self.play_thread)
+        self.play_worker.opened.connect(self._on_playback_opened)
+        self.play_worker.frame.connect(self._on_playback_frame)
+        self.play_worker.ended.connect(self._on_playback_ended)
+        self.play_worker.failed.connect(self._on_playback_failed)
+        self.request_open.connect(self.play_worker.open)
+        self.request_frame.connect(self.play_worker.deliver_next)
+        self.request_seek.connect(self.play_worker.seek)
+        self.play_thread.start()
+        self.comparison = path
+        self.compare_with_button.setText(path.name)
+        self.request_open.emit()
+
+    def _on_playback_opened(self, fps: float, frames: int, start: float, end: float) -> None:
+        self._play_fps = fps if fps > 0 else 24.0
+        self.position.setRange(0, max(0, frames - 1))
+        self.position.setEnabled(frames > 0)
+        self.play_button.setEnabled(frames > 0)
+        self._play_duration = frames / self._play_fps if self._play_fps else 0.0
+        self._append(
+            f"Ready to play {self.comparison.name}: {frames} frames at "
+            f"{self._play_fps:.3f} fps, covering {start:.1f}-{end:.1f}s of the source."
+        )
+        # Show the first frame straight away, so attaching a result is visibly
+        # different from attaching nothing.
+        self._frame_in_flight = True
+        self.request_frame.emit()
+
+    def _on_playback_frame(self, pair) -> None:
+        self._frame_in_flight = False
+        self.view.set_frame(pair.before, pair.after)
+        if not self.position.isSliderDown():
+            self.position.blockSignals(True)
+            self.position.setValue(pair.index)
+            self.position.blockSignals(False)
+        self.time_label.setText(
+            f"{_clock(pair.seconds)} / {_clock(self._play_duration)}"
+        )
+
+    def _on_playback_ended(self) -> None:
+        self._frame_in_flight = False
+        if self.loop_check.isChecked() and self.play_timer.isActive():
+            self.request_seek.emit(0.0)
+            return
+        self._pause()
+
+    def _on_playback_failed(self, message: str) -> None:
+        self._frame_in_flight = False
+        self._pause()
+        self._append(f"Playback failed: {message}")
+        QMessageBox.warning(self, "Could not play", message)
+
+    def _toggle_play(self) -> None:
+        if self.play_timer.isActive():
+            self._pause()
+        else:
+            self.view.set_playing(True)
+            self.play_button.setText("Pause")
+            self.play_timer.start(max(1, round(1000.0 / self._play_fps)))
+
+    def _pause(self) -> None:
+        self.play_timer.stop()
+        self.view.set_playing(False)
+        self.play_button.setText("Play")
+
+    def _tick(self) -> None:
+        """Ask for the next frame, unless the last one has not arrived.
+
+        Dropping a frame is the right failure here. Queueing another request
+        behind a slow decode would put playback further behind real time with
+        every tick, and it would never recover.
+        """
+        if self._frame_in_flight:
+            return
+        self._frame_in_flight = True
+        self.request_frame.emit()
+
+    def _seek_to_slider(self) -> None:
+        if self._play_fps:
+            self._frame_in_flight = True
+            self.request_seek.emit(self.position.value() / self._play_fps)
+
+    def _stop_playback(self) -> None:
+        self._pause()
+        if self.play_thread is None:
+            return
+        # Quit and wait FIRST. shutdown() closes the ffmpeg pipes the worker
+        # thread is reading from, so calling it while that thread is still
+        # live is a race against a decode already in progress.
+        self.play_thread.quit()
+        self.play_thread.wait()
+        if self.play_worker is not None:
+            self.play_worker.shutdown()
+        self.play_thread.deleteLater()
+        self.play_thread = None
+        self.play_worker = None
+        self._frame_in_flight = False
+
     # --- single-frame comparison --------------------------------------------
 
     def _run_compare(self) -> None:
@@ -1328,6 +1593,15 @@ class MainWindow(QMainWindow):
         if self.active_task is not None:
             self.queue.finish(self.active_task)
         self._teardown()
+
+        # Attach what was just produced, so Play works without hunting for the
+        # file. A still has nothing to play.
+        from .images import is_image
+
+        result = Path(path)
+        if self.source is not None and not is_image(result) and result.exists():
+            self._load_comparison(result)
+
         self._start_next()
 
     def _on_failed(self, message: str) -> None:
@@ -1390,6 +1664,7 @@ class MainWindow(QMainWindow):
             thread.wait()
         self.compare_thread = self.thread = None
         self.compare_worker = self.worker = None
+        self._stop_playback()
         super().closeEvent(event)
 
     def bring_to_front(self) -> None:

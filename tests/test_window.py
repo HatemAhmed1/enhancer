@@ -595,3 +595,85 @@ def test_closing_mid_comparison_does_not_abort_the_process(window):
 
     assert window.compare_thread is None
     assert not thread.isRunning()
+
+
+def test_browse_offers_images_as_well_as_video(window):
+    """The dialog listed video only, so a still could not be opened at all."""
+    from enhancer.window import source_filter
+
+    text = source_filter()
+    for pattern in ("*.png", "*.jpg", "*.webp", "*.mp4", "*.mkv"):
+        assert pattern in text, f"Browse cannot open {pattern}"
+    assert text.startswith("All supported (")
+
+
+def test_one_list_decides_what_can_be_opened(window):
+    """Three lists had drifted: dialog, drag-and-drop and the image engine."""
+    from enhancer.images import IMAGE_SUFFIXES
+    from enhancer.window import MEDIA_SUFFIXES, VIDEO_SUFFIXES
+
+    assert IMAGE_SUFFIXES <= MEDIA_SUFFIXES, "drag-and-drop rejects supported stills"
+    assert MEDIA_SUFFIXES == VIDEO_SUFFIXES | IMAGE_SUFFIXES
+
+
+# --- playback ---------------------------------------------------------------
+
+
+def test_playback_is_refused_until_a_result_is_attached(window):
+    assert not window.play_button.isEnabled()
+    assert not window.position.isEnabled()
+    assert window.time_label.text() == "--:-- / --:--"
+
+
+def test_the_clock_grows_an_hours_field_only_when_needed():
+    from enhancer.window import _clock
+
+    assert _clock(0) == "0:00"
+    assert _clock(62.7) == "1:02"
+    assert _clock(3600) == "1:00:00"
+    assert _clock(-5) == "0:00"
+
+
+def test_a_slow_decode_drops_a_frame_rather_than_queueing_it(window):
+    """Queueing behind a slow decode puts playback further behind every tick."""
+    asked = []
+    window.request_frame.connect(lambda: asked.append(1))
+
+    window._frame_in_flight = False
+    window._tick()
+    window._tick()
+    window._tick()
+
+    assert len(asked) == 1, "requests piled up behind an unanswered one"
+
+
+def test_reaching_the_end_stops_unless_looping(window):
+    window.loop_check.setChecked(False)
+    window.play_timer.start(1000)
+    window._on_playback_ended()
+    assert not window.play_timer.isActive()
+    assert window.play_button.text() == "Play"
+
+
+def test_looping_rewinds_instead_of_stopping(window):
+    sought = []
+    window.request_seek.connect(sought.append)
+    window.loop_check.setChecked(True)
+    window.play_timer.start(1000)
+    window._on_playback_ended()
+
+    assert sought == [0.0]
+    assert window.play_timer.isActive(), "looping stopped playback"
+    window._pause()
+
+
+def test_closing_mid_playback_stops_the_stream(window):
+    from PySide6.QtCore import QThread
+
+    thread = QThread()
+    thread.start()
+    window.play_thread = thread
+    window.close()
+
+    assert window.play_thread is None
+    assert not thread.isRunning()
