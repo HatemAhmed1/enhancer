@@ -201,3 +201,64 @@ def test_no_budget_falls_back_to_the_physical_ceiling():
 
     up = Upscaler(FakeModel(), tile=256, overlap=0, device="cuda", half=False)
     assert up.runner.vram_ceiling == physical_vram_ceiling(total_vram_bytes())
+
+
+# ---------------------------------------------------------------------------
+# Non-CUDA accelerators. This machine is Windows + NVIDIA, so MPS and XPU are
+# simulated: the model and tensors stay on CPU while the Upscaler is told it is
+# on another backend, which exercises every decision __init__ makes from the
+# device type. Actually running kernels on those backends is not testable here.
+# ---------------------------------------------------------------------------
+
+
+def _pretend_backend(monkeypatch, kind, total):
+    """Make `kind` look present, with `total` bytes, without moving tensors."""
+    from enhancer import vram as vram_module
+
+    monkeypatch.setitem(vram_module._AVAILABILITY, kind, lambda: True)
+    monkeypatch.setitem(vram_module._MEMORY_PROBES, kind, lambda: (total, total))
+
+
+@pytest.mark.parametrize("kind", ["mps", "xpu"])
+def test_accelerators_get_a_pressure_ceiling_like_cuda(monkeypatch, kind):
+    from enhancer.vram import HEADROOM_BYTES
+
+    _pretend_backend(monkeypatch, kind, 16 * 1024 ** 3)
+    up = Upscaler(FakeModel(), tile=256, overlap=0, device=kind, half=False)
+    assert up.runner.vram_ceiling == 16 * 1024 ** 3 - HEADROOM_BYTES
+
+
+@pytest.mark.parametrize("kind", ["mps", "xpu"])
+def test_half_is_enabled_on_accelerators_other_than_cuda(monkeypatch, kind):
+    _pretend_backend(monkeypatch, kind, 16 * 1024 ** 3)
+    up = Upscaler(FakeHalfModel(), tile=256, overlap=0, device=kind, half=True)
+    assert up.half is True
+
+
+def test_half_is_never_enabled_on_cpu():
+    up = Upscaler(FakeHalfModel(), tile=256, overlap=0, device="cpu", half=True)
+    assert up.half is False
+
+
+@pytest.mark.parametrize("kind", ["mps", "xpu"])
+def test_vram_budget_applies_on_accelerators_other_than_cuda(monkeypatch, kind):
+    _pretend_backend(monkeypatch, kind, 16 * 1024 ** 3)
+    budget = 512 * 1024 ** 2
+    up = Upscaler(FakeModel(), tile=256, overlap=0, device=kind, half=False,
+                  vram_budget=budget)
+    assert up.runner.vram_ceiling == budget
+
+
+def test_process_skips_the_pressure_check_when_no_peak_is_reportable(monkeypatch, rng):
+    """A backend with no peak counter must not be read as 'peak = 0'."""
+    from enhancer import upscale as upscale_module
+
+    monkeypatch.setattr(upscale_module, "peak_memory_bytes", lambda device: None)
+    checked = []
+    frame = rng.integers(0, 256, (32, 32, 3), dtype=np.uint8)
+    up = Upscaler(FakeModel(scale=2), tile=16, overlap=4, device="cpu")
+    monkeypatch.setattr(up.runner, "_check_pressure", lambda peak: checked.append(peak))
+    up.process(frame)
+    # run() always makes its own no-op call with peak_bytes=None; what must
+    # not happen is a live check reporting a peak of zero.
+    assert all(peak is None for peak in checked)

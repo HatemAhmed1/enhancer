@@ -423,3 +423,335 @@ def test_runner_ignores_peak_when_no_ceiling_configured():
     img = torch.rand(1, 3, 64, 64)
     runner.run(lambda t: t, img, peak_bytes=10 ** 12)
     assert runner.tile == 512
+
+
+# ---------------------------------------------------------------------------
+# Backend selection.
+#
+# This machine has CUDA and cannot have MPS or XPU, so every non-CUDA backend
+# here is simulated by replacing the availability probes. What is being tested
+# is the POLICY (order, guarding, fallback), which is the part that has to be
+# right on hardware we cannot borrow.
+# ---------------------------------------------------------------------------
+
+import types
+
+from enhancer import vram as vram_module
+from enhancer.vram import (
+    ACCELERATOR_PRIORITY,
+    available_accelerators,
+    device_memory_bytes,
+    device_memory_ceiling,
+    empty_device_cache,
+    free_vram_bytes,
+    is_accelerator_available,
+    peak_memory_bytes,
+    reset_peak_memory,
+    select_accelerator,
+    supports_half,
+    total_vram_bytes,
+)
+
+
+def _only(monkeypatch, *available):
+    """Pretend exactly `available` accelerators exist."""
+    for kind in ACCELERATOR_PRIORITY:
+        monkeypatch.setitem(
+            vram_module._AVAILABILITY, kind, lambda kind=kind: kind in available
+        )
+
+
+def test_prefers_cuda_over_everything(monkeypatch):
+    _only(monkeypatch, "cuda", "mps", "xpu")
+    assert select_accelerator() == torch.device("cuda")
+
+
+def test_falls_to_mps_when_there_is_no_cuda(monkeypatch):
+    _only(monkeypatch, "mps", "xpu")
+    assert select_accelerator() == torch.device("mps")
+
+
+def test_falls_to_xpu_when_there_is_no_cuda_or_mps(monkeypatch):
+    _only(monkeypatch, "xpu")
+    assert select_accelerator() == torch.device("xpu")
+
+
+def test_falls_to_cpu_when_nothing_is_available(monkeypatch):
+    _only(monkeypatch)
+    assert select_accelerator() == torch.device("cpu")
+
+
+def test_cpu_is_forced_even_when_an_accelerator_exists(monkeypatch):
+    _only(monkeypatch, "cuda", "mps", "xpu")
+    assert select_accelerator(prefer_accelerator=False) == torch.device("cpu")
+
+
+def test_select_device_still_takes_prefer_cuda_by_keyword(monkeypatch):
+    """cli.py and window.py call select_device(prefer_cuda=not args.cpu)."""
+    _only(monkeypatch, "mps")
+    assert select_device(prefer_cuda=True) == torch.device("mps")
+    assert select_device(prefer_cuda=False) == torch.device("cpu")
+
+
+def test_available_accelerators_is_in_preference_order(monkeypatch):
+    _only(monkeypatch, "xpu", "cuda")
+    assert available_accelerators() == ("cuda", "xpu")
+
+
+def test_missing_backend_module_is_not_an_error(monkeypatch):
+    """A torch build without XPU has no torch.xpu attribute at all."""
+    monkeypatch.delattr(torch, "xpu", raising=False)
+    monkeypatch.delattr(torch.backends, "mps", raising=False)
+    assert vram_module._xpu_available() is False
+    assert vram_module._mps_available() is False
+    assert isinstance(select_accelerator(), torch.device)
+
+
+def test_a_probe_that_raises_reads_as_unavailable(monkeypatch):
+    """A half-installed driver can make is_available() itself throw."""
+
+    def explode():
+        raise RuntimeError("driver shim exploded")
+
+    monkeypatch.setitem(vram_module._AVAILABILITY, "cuda", explode)
+    assert is_accelerator_available("cuda") is False
+
+
+def test_unknown_accelerator_name_is_false():
+    assert is_accelerator_available("tpu") is False
+
+
+# ---------------------------------------------------------------------------
+# Memory reporting.
+# ---------------------------------------------------------------------------
+
+
+def test_cpu_reports_system_ram_not_zero():
+    """Really executed here: the tile planner sizes work from these numbers,
+    and 0 would pin every non-CUDA machine to the smallest tile."""
+    free, total = device_memory_bytes("cpu")
+    assert total > 1024 ** 3, "a machine running torch has more than 1 GB"
+    assert 0 < free <= total
+
+
+def test_cpu_free_memory_feeds_a_sensible_tile():
+    tile = choose_tile(free_vram_bytes("cpu"), bytes_per_output_pixel=64)
+    assert tile in TILE_LADDER
+
+
+def test_memory_probe_that_raises_reports_zero(monkeypatch):
+    def explode():
+        raise RuntimeError("no such device")
+
+    monkeypatch.setitem(vram_module._MEMORY_PROBES, "xpu", explode)
+    assert device_memory_bytes("xpu") == (0, 0)
+
+
+def test_mps_total_is_the_recommended_working_set(monkeypatch):
+    """Unified memory has no VRAM figure, so `total` is Metal's recommended
+    max working set and `free` is what is left of it."""
+    fake_mps = types.SimpleNamespace(
+        recommended_max_memory=lambda: 16 * 1024 ** 3,
+        driver_allocated_memory=lambda: 2 * 1024 ** 3,
+    )
+    monkeypatch.setattr(torch, "mps", fake_mps, raising=False)
+    free, total = vram_module._mps_memory_bytes()
+    assert total == 16 * 1024 ** 3
+    assert free == 14 * 1024 ** 3
+
+
+def test_mps_falls_back_to_system_ram_on_old_torch(monkeypatch):
+    monkeypatch.setattr(torch, "mps", types.SimpleNamespace(), raising=False)
+    monkeypatch.setattr(
+        vram_module, "_system_memory_bytes", lambda: (4 * 1024 ** 3, 8 * 1024 ** 3)
+    )
+    free, total = vram_module._mps_memory_bytes()
+    assert total == 8 * 1024 ** 3
+    assert free == 8 * 1024 ** 3  # nothing allocated that we can see
+
+
+def test_xpu_uses_mem_get_info_when_present(monkeypatch):
+    fake_xpu = types.SimpleNamespace(
+        is_available=lambda: True,
+        mem_get_info=lambda: (3 * 1024 ** 3, 8 * 1024 ** 3),
+    )
+    monkeypatch.setattr(torch, "xpu", fake_xpu, raising=False)
+    monkeypatch.setitem(vram_module._AVAILABILITY, "xpu", lambda: True)
+    assert vram_module._xpu_memory_bytes() == (3 * 1024 ** 3, 8 * 1024 ** 3)
+
+
+def test_xpu_falls_back_to_device_properties(monkeypatch):
+    """Some Arc parts cannot report free memory at all."""
+
+    def refuses():
+        raise RuntimeError("The device doesn't support querying the available free memory")
+
+    fake_xpu = types.SimpleNamespace(
+        is_available=lambda: True,
+        mem_get_info=refuses,
+        get_device_properties=lambda: types.SimpleNamespace(total_memory=8 * 1024 ** 3),
+        memory_reserved=lambda: 1024 ** 3,
+    )
+    monkeypatch.setattr(torch, "xpu", fake_xpu, raising=False)
+    monkeypatch.setitem(vram_module._AVAILABILITY, "xpu", lambda: True)
+    assert vram_module._xpu_memory_bytes() == (7 * 1024 ** 3, 8 * 1024 ** 3)
+
+
+def test_total_and_free_default_to_the_selected_device(monkeypatch):
+    _only(monkeypatch, "mps")
+    monkeypatch.setitem(
+        vram_module._MEMORY_PROBES, "mps", lambda: (1024 ** 3, 4 * 1024 ** 3)
+    )
+    assert total_vram_bytes() == 4 * 1024 ** 3
+    assert free_vram_bytes() == 1024 ** 3
+
+
+# ---------------------------------------------------------------------------
+# The pressure ceiling, per backend.
+# ---------------------------------------------------------------------------
+
+
+def test_ceiling_applies_to_mps_because_it_oversubscribes_too(monkeypatch):
+    """torch's MPS high-watermark ratio defaults to 1.7, so allocations above
+    the recommended working set are allowed through silently and the machine
+    swaps - the same shape of hazard as Windows WDDM."""
+    monkeypatch.setitem(
+        vram_module._MEMORY_PROBES, "mps", lambda: (0, 16 * 1024 ** 3)
+    )
+    assert device_memory_ceiling("mps") == 16 * 1024 ** 3 - HEADROOM_BYTES
+
+
+def test_ceiling_is_none_on_cpu():
+    assert device_memory_ceiling("cpu") is None
+
+
+def test_ceiling_is_none_when_total_is_unknown(monkeypatch):
+    monkeypatch.setitem(vram_module._MEMORY_PROBES, "xpu", lambda: (0, 0))
+    assert device_memory_ceiling("xpu") is None
+
+
+def test_peak_memory_is_none_rather_than_zero_when_unknowable(monkeypatch):
+    """None means 'no signal'; zero would read as 'comfortably under'."""
+    monkeypatch.setattr(torch, "xpu", types.SimpleNamespace(), raising=False)
+    assert peak_memory_bytes("xpu") is None
+
+
+def test_peak_memory_uses_current_allocated_on_mps(monkeypatch):
+    """torch.mps has no peak counter; the current figure under-reports, which
+    can only miss pressure rather than invent it."""
+    fake_mps = types.SimpleNamespace(current_allocated_memory=lambda: 4242)
+    monkeypatch.setattr(torch, "mps", fake_mps, raising=False)
+    assert peak_memory_bytes("mps") == 4242
+
+
+def test_peak_memory_uses_max_allocated_on_xpu(monkeypatch):
+    fake_xpu = types.SimpleNamespace(max_memory_allocated=lambda: 99)
+    monkeypatch.setattr(torch, "xpu", fake_xpu, raising=False)
+    assert peak_memory_bytes("xpu") == 99
+
+
+def test_reset_and_empty_cache_are_no_ops_where_unsupported(monkeypatch):
+    monkeypatch.setattr(torch, "xpu", types.SimpleNamespace(), raising=False)
+    reset_peak_memory("xpu")  # must not raise
+    empty_device_cache("xpu")  # must not raise
+    reset_peak_memory("cpu")
+    empty_device_cache("cpu")
+
+
+def test_empty_cache_is_dispatched_to_the_right_backend(monkeypatch):
+    called = []
+    fake_mps = types.SimpleNamespace(empty_cache=lambda: called.append("mps"))
+    monkeypatch.setattr(torch, "mps", fake_mps, raising=False)
+    empty_device_cache(torch.device("mps"))
+    assert called == ["mps"]
+
+
+# ---------------------------------------------------------------------------
+# Half precision, per backend.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", ["cuda", "mps", "xpu"])
+def test_half_is_worth_it_on_every_accelerator(kind):
+    assert supports_half(kind) is True
+
+
+def test_half_is_not_worth_it_on_cpu():
+    assert supports_half("cpu") is False
+
+
+# ---------------------------------------------------------------------------
+# OOM classification on the backends we cannot run.
+#
+# Message forms taken from torch's own allocators and from the runtimes
+# underneath them; getting these wrong turns a recoverable OOM into a hard
+# failure instead of a tile shrink.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # torch/mps: MPSAllocator's own wording.
+        "MPS backend out of memory (MPS allocated: 9.06 GB, other allocations: "
+        "1.30 GB, max allowed: 10.67 GB). Tried to allocate 256 bytes on private "
+        "pool. Use PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 to disable upper limit "
+        "for memory allocations (may cause system failure).",
+        # Metal refusing one oversized buffer: no "out of memory" anywhere.
+        "Invalid buffer size: 12.00 GB",
+        "MPSNDArray.mm error: total bytes of NDArray > 2**32",
+    ],
+)
+def test_is_oom_error_recognises_mps_failures(message):
+    assert is_oom_error(RuntimeError(message)) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "XPU out of memory. Tried to allocate 4.00 GiB. GPU 0 has a total "
+        "capacity of 15.11 GiB.",
+        "Native API failed. Native API returns: -5 "
+        "(UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)",
+        "UR error: UR_RESULT_ERROR_OUT_OF_HOST_MEMORY",
+        "Native API failed. Native API returns: -5 (PI_ERROR_OUT_OF_RESOURCES)",
+    ],
+)
+def test_is_oom_error_recognises_xpu_failures(message):
+    assert is_oom_error(RuntimeError(message)) is True
+
+
+def test_is_oom_error_accepts_the_shared_typed_error():
+    """torch>=2.4 raises one torch.OutOfMemoryError from every backend."""
+    typed = getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
+    assert is_oom_error(typed("MPS backend out of memory")) is True
+
+
+def test_is_oom_error_still_rejects_an_illegal_memory_access():
+    """The narrowness that keeps a real bug from being retried forever."""
+    assert is_oom_error(
+        RuntimeError("CUDA error: an illegal memory access was encountered")
+    ) is False
+
+
+def test_is_oom_error_rejects_a_shape_mismatch():
+    assert is_oom_error(RuntimeError("size mismatch for weight")) is False
+
+
+def test_runner_recovers_from_an_mps_style_oom():
+    """End to end: an MPS message must shrink the tile, not kill the render."""
+    calls = {"n": 0}
+
+    def fn(t):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError(
+                "MPS backend out of memory (MPS allocated: 9.06 GB, other "
+                "allocations: 1.30 GB, max allowed: 10.67 GB)."
+            )
+        return t
+
+    runner = TileRunner(tile=512, overlap=0, scale=1, min_tile=128)
+    out = runner.run(fn, torch.rand(1, 3, 64, 64))
+    assert out.shape == (1, 3, 64, 64)
+    assert runner.tile < 512

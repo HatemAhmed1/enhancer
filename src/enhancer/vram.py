@@ -1,8 +1,10 @@
-"""Tiling, tiled execution, and out-of-memory recovery."""
+"""Tiling, tiled execution, out-of-memory recovery, and device selection."""
 
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -26,22 +28,60 @@ MAX_PROBE_INTERVAL: int = 8192
 # Substrings identifying a RECOVERABLE allocation failure. Deliberately narrow:
 # "CUDA error: an illegal memory access" is unrecoverable and must NOT match,
 # because retrying it forever would hide a real bug.
+#
+# Every backend's own allocator says "out of memory" somewhere in its message
+# ("CUDA out of memory", "MPS backend out of memory (MPS allocated: ...)",
+# "XPU out of memory. Tried to allocate ..."), so that one marker carries most
+# of the weight. The rest exist because the layer UNDER the allocator - Metal
+# on macOS, Level Zero/UR on Intel - reports the same condition in its own
+# words, and those never contain the phrase.
 _OOM_MARKERS: tuple[str, ...] = (
+    # CUDA, and the common wording of torch's allocator on every backend.
     "out of memory",
     "alloc_failed",
     "cuda_error_out_of_memory",
+    # MPS: Metal rejects an oversized single buffer with its own wording,
+    # e.g. "Invalid buffer size: 12.00 GB" or an MPSNDArray complaint that the
+    # array exceeds the 2**32-byte limit. Both are fixed by a smaller tile.
+    "invalid buffer size",
+    "total bytes of ndarray",
+    # XPU: Level Zero / Unified Runtime failures reach Python as a plain
+    # RuntimeError carrying the runtime's enum name rather than prose, e.g.
+    # "Native API failed. ... UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY".
+    # Underscored, so "out of memory" above does not match them.
+    "out_of_device_memory",
+    "out_of_host_memory",
+    "out_of_resources",
+)
+
+# torch>=2.4 exposes a single torch.OutOfMemoryError shared by every backend,
+# and torch.cuda.OutOfMemoryError is an alias for it. Older builds have only
+# the cuda one. Resolve whatever exists, de-duplicated, so isinstance() works
+# on any version without a version check.
+_OOM_TYPES: tuple[type[BaseException], ...] = tuple(
+    dict.fromkeys(
+        candidate
+        for candidate in (
+            getattr(torch, "OutOfMemoryError", None),
+            getattr(torch.cuda, "OutOfMemoryError", None),
+            MemoryError,
+        )
+        if isinstance(candidate, type) and issubclass(candidate, BaseException)
+    )
 )
 
 
 def is_oom_error(exc: BaseException) -> bool:
     """True if `exc` is a recoverable allocation failure.
 
-    CUDA exhaustion does not always arrive as torch.cuda.OutOfMemoryError.
+    Accelerator exhaustion does not always arrive as a typed OutOfMemoryError.
     cuDNN and cuBLAS workspace allocation and driver-level failures surface as
-    a plain RuntimeError, and the CPU fallback path raises MemoryError. Catching
-    only the typed error lets a real OOM kill a multi-hour render.
+    a plain RuntimeError, MPS reports Metal's own buffer complaints, XPU can
+    surface a Level Zero error instead of the typed one, and the CPU fallback
+    path raises MemoryError. Catching only the typed error lets a real OOM kill
+    a multi-hour render.
     """
-    if isinstance(exc, (torch.cuda.OutOfMemoryError, MemoryError)):
+    if isinstance(exc, _OOM_TYPES):
         return True
     if isinstance(exc, RuntimeError):
         message = str(exc).lower()
@@ -256,8 +296,10 @@ class TileRunner:
                 if not doubled_this_call:
                     self._probe_interval = min(self._probe_interval * 2, MAX_PROBE_INTERVAL)
                     doubled_this_call = True
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # Whatever device the frame is on: releasing the caching
+                # allocator's pools is what makes the retry at a smaller tile
+                # more likely to succeed, and every backend spells it the same.
+                empty_device_cache(img.device)
                 if self.tile <= self.min_tile:
                     raise TileFloorReached(
                         f"allocation failed at minimum tile size {self.min_tile}"
@@ -352,24 +394,368 @@ def physical_vram_ceiling(total_bytes: int) -> int:
     return max(0, total_bytes - HEADROOM_BYTES)
 
 
-def total_vram_bytes() -> int:
-    """Physical VRAM on the current CUDA device, or 0 when unavailable."""
-    if not torch.cuda.is_available():
-        return 0
-    _free, total = torch.cuda.mem_get_info()
-    return int(total)
+# ---------------------------------------------------------------------------
+# Backends
+#
+# Every accelerator is optional AT RUNTIME, not just at import time: a wheel
+# built without XPU support has no `torch.xpu` attribute at all, `torch.backends
+# .mps` is absent on non-Apple builds, and any of these probes can still raise
+# on a machine with a half-installed driver. So each one is guarded twice, by
+# hasattr and by try. A missing backend is a normal condition, never an error.
+# ---------------------------------------------------------------------------
+
+# Preference order. CUDA first because it is the fastest and best supported
+# path; MPS before XPU only because Apple's backend is the more mature of the
+# two. CPU is not listed: it is the fallback when none of these answer.
+ACCELERATOR_PRIORITY: tuple[str, ...] = ("cuda", "mps", "xpu")
 
 
-def free_vram_bytes() -> int:
-    """Free VRAM on the current CUDA device, or 0 when CUDA is unavailable."""
-    if not torch.cuda.is_available():
-        return 0
-    free, _total = torch.cuda.mem_get_info()
-    return int(free)
+def _cuda_available() -> bool:
+    try:
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _mps_available() -> bool:
+    backend = getattr(torch.backends, "mps", None)
+    if backend is None or not hasattr(backend, "is_available"):
+        return False
+    try:
+        # is_built() is False on a non-Apple wheel that still ships the module.
+        if hasattr(backend, "is_built") and not backend.is_built():
+            return False
+        return bool(backend.is_available())
+    except Exception:
+        return False
+
+
+def _xpu_available() -> bool:
+    xpu = getattr(torch, "xpu", None)
+    if xpu is None or not hasattr(xpu, "is_available"):
+        return False
+    try:
+        return bool(xpu.is_available())
+    except Exception:
+        return False
+
+
+_AVAILABILITY: dict[str, Callable[[], bool]] = {
+    "cuda": _cuda_available,
+    "mps": _mps_available,
+    "xpu": _xpu_available,
+}
+
+
+def is_accelerator_available(kind: str) -> bool:
+    """True if torch can actually use the named accelerator right now."""
+    probe = _AVAILABILITY.get(kind)
+    if probe is None:
+        return False
+    try:
+        return bool(probe())
+    except Exception:
+        # A half-installed driver can make is_available() itself throw. Not
+        # having a backend is never a reason to fail.
+        log.debug("availability probe for %s failed", kind, exc_info=True)
+        return False
+
+
+def available_accelerators() -> tuple[str, ...]:
+    """Every usable accelerator on this machine, best first."""
+    return tuple(k for k in ACCELERATOR_PRIORITY if is_accelerator_available(k))
+
+
+def select_accelerator(prefer_accelerator: bool = True) -> torch.device:
+    """Return the best available torch device: CUDA, MPS, XPU, then CPU.
+
+    With `prefer_accelerator=False` the answer is always CPU, which is what the
+    user asked for with --cpu.
+    """
+    if prefer_accelerator:
+        for kind in ACCELERATOR_PRIORITY:
+            if is_accelerator_available(kind):
+                return torch.device(kind)
+    return torch.device("cpu")
 
 
 def select_device(prefer_cuda: bool = True) -> torch.device:
-    """Return the best available torch device."""
-    if prefer_cuda and torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+    """Return the best available torch device.
+
+    The parameter name predates MPS and XPU support and now reads as a lie: it
+    has always meant "use an accelerator if there is one", so it still does.
+    Callers pass it by keyword, so it cannot simply be renamed. Prefer
+    `select_accelerator` in new code.
+    """
+    return select_accelerator(prefer_accelerator=prefer_cuda)
+
+
+# ---------------------------------------------------------------------------
+# Memory reporting
+#
+# These numbers size real work: choose_tile() turns `free` into a tile size and
+# Upscaler turns `total` into the peak-allocation ceiling. Before this, both
+# returned 0 on anything but CUDA, which meant an Apple or Intel machine got
+# cli._auto_tile's blind 256 fallback and NO pressure ceiling at all.
+# ---------------------------------------------------------------------------
+
+
+def _system_memory_bytes() -> tuple[int, int]:
+    """(free, total) system RAM in bytes, or (0, 0) if it cannot be found.
+
+    psutil is deliberately not a dependency here, so this uses only what the
+    standard library exposes on each platform.
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = _MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullAvailPhys), int(status.ullTotalPhys)
+        except Exception:
+            pass
+
+    try:
+        # Linux. MemAvailable is the honest "could be handed to a process
+        # without swapping" figure; MemFree ignores reclaimable page cache.
+        values: dict[str, int] = {}
+        with open("/proc/meminfo", encoding="ascii") as handle:
+            for line in handle:
+                key, _, rest = line.partition(":")
+                parts = rest.split()
+                if parts:
+                    values[key] = int(parts[0]) * 1024
+        total = values.get("MemTotal", 0)
+        free = values.get("MemAvailable", values.get("MemFree", 0))
+        if total:
+            return free, total
+    except Exception:
+        pass
+
+    try:
+        page = os.sysconf("SC_PAGE_SIZE")
+        total = page * os.sysconf("SC_PHYS_PAGES")
+        try:
+            free = page * os.sysconf("SC_AVPHYS_PAGES")
+        except (OSError, ValueError):
+            # macOS has no SC_AVPHYS_PAGES. Reporting half of physical RAM as
+            # free is a deliberate under-estimate: too small a tile is merely
+            # slower, too large a one is an OOM.
+            free = total // 2
+        if total > 0:
+            return int(free), int(total)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+    return 0, 0
+
+
+def _cuda_memory_bytes() -> tuple[int, int]:
+    if not _cuda_available():
+        return 0, 0
+    try:
+        free, total = torch.cuda.mem_get_info()
+    except Exception:
+        return 0, 0
+    return int(free), int(total)
+
+
+def _mps_memory_bytes() -> tuple[int, int]:
+    """(free, total) for Apple unified memory.
+
+    There is no dedicated VRAM to report, so "total" has to be defined rather
+    than measured. Metal's recommendedMaxWorkingSetSize - what
+    torch.mps.recommended_max_memory() returns - is the honest answer to "how
+    much of this machine's RAM may the GPU use", so that is `total`, and `free`
+    is what remains of it after the Metal driver's own allocations for this
+    process (which include the caching allocator's pools).
+
+    The memory is shared with the OS and every other application, so
+    HEADROOM_BYTES matters MORE here than on a discrete card, not less.
+    """
+    mps = getattr(torch, "mps", None)
+    total = 0
+    if mps is not None and hasattr(mps, "recommended_max_memory"):
+        try:
+            total = int(mps.recommended_max_memory())
+        except Exception:
+            total = 0
+    if total <= 0:
+        # Old torch without the query: fall back to physical RAM.
+        _free, total = _system_memory_bytes()
+    if total <= 0:
+        return 0, 0
+    used = 0
+    if mps is not None and hasattr(mps, "driver_allocated_memory"):
+        try:
+            used = int(mps.driver_allocated_memory())
+        except Exception:
+            used = 0
+    return max(0, total - used), total
+
+
+def _xpu_memory_bytes() -> tuple[int, int]:
+    xpu = getattr(torch, "xpu", None)
+    if xpu is None or not _xpu_available():
+        return 0, 0
+    if hasattr(xpu, "mem_get_info"):
+        try:
+            free, total = xpu.mem_get_info()
+            return int(free), int(total)
+        except Exception:
+            # Some Arc parts cannot report free memory at all; fall through to
+            # the device properties rather than giving up and returning 0.
+            pass
+    try:
+        total = int(xpu.get_device_properties().total_memory)
+    except Exception:
+        return 0, 0
+    try:
+        used = int(xpu.memory_reserved())
+    except Exception:
+        used = 0
+    return max(0, total - used), total
+
+
+_MEMORY_PROBES: dict[str, Callable[[], tuple[int, int]]] = {
+    "cuda": _cuda_memory_bytes,
+    "mps": _mps_memory_bytes,
+    "xpu": _xpu_memory_bytes,
+    "cpu": _system_memory_bytes,
+}
+
+
+def _device_kind(device: str | torch.device | None) -> str:
+    """The backend name for `device`, defaulting to the one we would pick."""
+    if device is None:
+        return select_accelerator().type
+    return torch.device(device).type
+
+
+def device_memory_bytes(device: str | torch.device | None = None) -> tuple[int, int]:
+    """(free, total) bytes of the memory `device` draws on. (0, 0) if unknown.
+
+    On CPU that is system RAM, not zero: the tile planner sizes work from these
+    numbers, so answering 0 there would silently pin every non-CUDA machine to
+    the smallest tile on the ladder.
+    """
+    probe = _MEMORY_PROBES.get(_device_kind(device))
+    if probe is None:
+        return 0, 0
+    try:
+        free, total = probe()
+    except Exception:
+        return 0, 0
+    return max(0, int(free)), max(0, int(total))
+
+
+def total_vram_bytes(device: str | torch.device | None = None) -> int:
+    """Total memory available to `device`, or 0 when it cannot be determined."""
+    return device_memory_bytes(device)[1]
+
+
+def free_vram_bytes(device: str | torch.device | None = None) -> int:
+    """Free memory available to `device`, or 0 when it cannot be determined."""
+    return device_memory_bytes(device)[0]
+
+
+def device_memory_ceiling(device: str | torch.device | None = None) -> int | None:
+    """Peak-allocation ceiling for `device`, or None when none applies.
+
+    Both hazards this guards against are the same shape. On Windows WDDM an
+    over-budget allocation spills into system-RAM-backed shared GPU memory
+    instead of raising. On MPS torch's high-watermark ratio defaults to 1.7, so
+    allocations between 1.0x and 1.7x of the recommended working set are also
+    allowed through silently, and the machine simply starts swapping. In both
+    cases an exception-driven policy alone never fires; the ceiling is what
+    gives the runner something to compare a measured peak against.
+
+    CPU returns None: its allocations are the system allocator's problem, and a
+    genuine exhaustion there raises MemoryError, which is_oom_error catches.
+    """
+    kind = _device_kind(device)
+    if kind == "cpu":
+        return None
+    total = total_vram_bytes(kind)
+    if total <= 0:
+        return None
+    return physical_vram_ceiling(total)
+
+
+def supports_half(device: str | torch.device | None = None) -> bool:
+    """Whether fp16 inference is worth doing on `device`.
+
+    cuda: yes, every card this targets runs fp16 at least at fp32 rate.
+    mps:  yes, Metal is fp16-native and Apple GPUs prefer it.
+    xpu:  yes, Arc/Xe fp16 throughput is at least fp32's.
+    cpu:  NO. torch's fp16 CPU kernels are a compatibility shim rather than an
+          optimisation - several ops have no fp16 CPU path at all and the ones
+          that do are slower than fp32. The CPU fallback is already the slow
+          path; making it slower and less compatible helps nobody.
+    """
+    return _device_kind(device) in ACCELERATOR_PRIORITY
+
+
+def empty_device_cache(device: str | torch.device | None = None) -> None:
+    """Release cached allocator blocks on `device`. A no-op where unsupported."""
+    module = getattr(torch, _device_kind(device), None)
+    release = getattr(module, "empty_cache", None)
+    if release is None:
+        return
+    try:
+        release()
+    except Exception:  # pragma: no cover - a failed cache flush is not fatal
+        log.debug("empty_cache failed on %s", device, exc_info=True)
+
+
+def reset_peak_memory(device: str | torch.device | None = None) -> None:
+    """Start a fresh peak-allocation measurement. A no-op where unsupported."""
+    module = getattr(torch, _device_kind(device), None)
+    reset = getattr(module, "reset_peak_memory_stats", None)
+    if reset is None:
+        return
+    try:
+        reset()
+    except Exception:  # pragma: no cover
+        log.debug("reset_peak_memory_stats failed on %s", device, exc_info=True)
+
+
+def peak_memory_bytes(device: str | torch.device | None = None) -> int | None:
+    """Peak bytes allocated since `reset_peak_memory`, or None if unknowable.
+
+    None means "no pressure signal", which is NOT the same as zero: zero would
+    read as "comfortably under the ceiling" and suppress the check entirely.
+    """
+    kind = _device_kind(device)
+    if kind == "mps":
+        # torch.mps exposes no peak counter. current_allocated_memory() is a
+        # deliberate under-estimate of the peak - it excludes the allocator's
+        # cached pools and is read after the run rather than at the high-water
+        # mark - so it can only ever MISS pressure, never invent it. That is
+        # the safe direction for a signal whose only effect is to shrink tiles.
+        module = getattr(torch, "mps", None)
+        probe = getattr(module, "current_allocated_memory", None)
+    else:
+        module = getattr(torch, kind, None)
+        probe = getattr(module, "max_memory_allocated", None)
+    if probe is None:
+        return None
+    try:
+        return int(probe())
+    except Exception:
+        return None

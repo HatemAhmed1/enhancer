@@ -7,7 +7,15 @@ import logging
 import numpy as np
 import torch
 
-from .vram import TileFloorReached, TileRunner, physical_vram_ceiling, total_vram_bytes
+from .vram import (
+    TileFloorReached,
+    TileRunner,
+    device_memory_ceiling,
+    peak_memory_bytes,
+    reset_peak_memory,
+    supports_half,
+    total_vram_bytes,
+)
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +51,10 @@ class Upscaler:
     ) -> None:
         self.model = model
         self.device = torch.device(device)
-        self.half = half and self.device.type == "cuda"
+        # Half precision is a per-backend decision, not a CUDA one: MPS and XPU
+        # both run fp16 at least as fast as fp32, while on CPU it is a slow
+        # compatibility shim. supports_half() owns that judgement.
+        self.half = half and supports_half(self.device)
         if self.half:
             # Derive the half decision from the model's ACTUAL parameter
             # dtype, not from the caller's flag alone. load_model() only casts
@@ -62,14 +73,14 @@ class Upscaler:
                     "this tier in fp32, which will be slower",
                     getattr(model, "arch", type(model).__name__), model_dtype,
                 )
-        if self.device.type != "cuda":
+        if self.device.type == "cpu":
             ceiling = None
         elif vram_budget is not None:
             # An explicit cap, so the machine stays usable for other work. The
             # render slows when it bites, but never fails: tiles shrink and the
             # per-frame CPU fallback remains in place underneath.
             ceiling = max(1, int(vram_budget))
-            physical = total_vram_bytes()
+            physical = total_vram_bytes(self.device)
             if physical and ceiling > physical:
                 # Above the card's own memory, so the driver will spill into
                 # system RAM. That makes an oversized model runnable at all,
@@ -80,7 +91,7 @@ class Upscaler:
                     ceiling / 1024 ** 3, physical / 1024 ** 3,
                 )
         else:
-            ceiling = physical_vram_ceiling(total_vram_bytes())
+            ceiling = device_memory_ceiling(self.device)
         self.runner = TileRunner(
             tile=tile, overlap=overlap, scale=model.scale,
             min_tile=128, vram_ceiling=ceiling,
@@ -101,17 +112,17 @@ class Upscaler:
 
     def process(self, frame: np.ndarray) -> np.ndarray:
         img = to_tensor(frame).to(self.device)
-        track = self.device.type == "cuda" and torch.cuda.is_available()
-        if track:
-            torch.cuda.reset_peak_memory_stats()
+        reset_peak_memory(self.device)
         try:
             out = self.runner.run(self._infer, img)
-            if track:
-                # The true peak is only known once the run has finished, so it
-                # cannot be passed into run() itself; this is the single live
-                # pressure check for this frame (run()'s own internal check is
-                # a no-op here since it is called without peak_bytes).
-                peak = int(torch.cuda.max_memory_allocated())
+            # The true peak is only known once the run has finished, so it
+            # cannot be passed into run() itself; this is the single live
+            # pressure check for this frame (run()'s own internal check is
+            # a no-op here since it is called without peak_bytes).
+            # None means the backend cannot report a peak at all, which must
+            # not be confused with a peak of zero.
+            peak = peak_memory_bytes(self.device)
+            if peak is not None:
                 self.runner._check_pressure(peak)
         except TileFloorReached:
             self.cpu_fallback_count += 1
