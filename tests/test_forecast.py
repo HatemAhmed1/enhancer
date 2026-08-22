@@ -188,3 +188,85 @@ def test_unknown_model_falls_back_to_its_architecture():
 
 def test_a_completely_unknown_model_still_gets_a_rate():
     assert throughput_for("mystery.pth") > 0
+
+
+# --- calibrating to the machine it is running on ----------------------------
+
+
+def test_nothing_measured_means_the_reference_numbers(tmp_path, monkeypatch):
+    """A first run has no measurements, and must not pretend otherwise."""
+    from enhancer import forecast
+
+    monkeypatch.setattr(forecast, "_state_dir", lambda: tmp_path)
+    assert forecast.machine_ratio() == 1.0
+    assert forecast.throughput_for("2xParimgCompact.pth") == 8.0
+
+
+def test_a_measured_model_beats_the_table(tmp_path, monkeypatch):
+    from enhancer import forecast
+
+    monkeypatch.setattr(forecast, "_state_dir", lambda: tmp_path)
+    forecast.record_measurement("2xParimgCompact.pth", 24.0)
+    assert forecast.throughput_for("2xParimgCompact.pth") == 24.0
+
+
+def test_a_faster_machine_scales_models_it_has_never_run(tmp_path, monkeypatch):
+    """The point of the ratio: one measurement improves every estimate.
+
+    The built-in table was measured on one laptop card. Somebody with a
+    desktop 4090 would otherwise be told a render takes four times as long as
+    it really does, for every model, forever.
+    """
+    from enhancer import forecast
+
+    monkeypatch.setattr(forecast, "_state_dir", lambda: tmp_path)
+    forecast.record_measurement("2xParimgCompact.pth", 24.0)  # 3x the reference
+
+    assert forecast.machine_ratio() == pytest.approx(3.0)
+    assert forecast.throughput_for("RealESRGAN_x2plus.pth") == pytest.approx(0.82 * 3)
+    assert forecast.throughput_for("Unseen.pth", "span") == pytest.approx(5.5 * 3)
+
+
+def test_a_slower_machine_scales_down(tmp_path, monkeypatch):
+    from enhancer import forecast
+
+    monkeypatch.setattr(forecast, "_state_dir", lambda: tmp_path)
+    forecast.record_measurement("2xParimgCompact.pth", 2.0)
+    forecast.record_measurement("RealESRGAN_x2plus.pth", 0.2)
+
+    assert forecast.machine_ratio() < 0.3
+    assert forecast.throughput_for("4xPurePhoto-span.pth") < 6.9
+
+
+def test_one_bad_run_does_not_become_the_truth(tmp_path, monkeypatch):
+    """A render that fought a game for the card should not rewrite history."""
+    from enhancer import forecast
+
+    monkeypatch.setattr(forecast, "_state_dir", lambda: tmp_path)
+    forecast.record_measurement("2xParimgCompact.pth", 8.0)
+    forecast.record_measurement("2xParimgCompact.pth", 2.0)
+
+    assert forecast.throughput_for("2xParimgCompact.pth") == pytest.approx(5.0)
+
+
+def test_a_corrupt_measurement_file_is_ignored(tmp_path, monkeypatch):
+    """A first run must never fail because of a half-written file."""
+    from enhancer import forecast
+
+    monkeypatch.setattr(forecast, "_state_dir", lambda: tmp_path)
+    forecast.measurements_path().parent.mkdir(parents=True, exist_ok=True)
+    forecast.measurements_path().write_text("{not json", encoding="utf-8")
+
+    assert forecast.load_measurements() == {}
+    assert forecast.throughput_for("2xParimgCompact.pth") == 8.0
+
+
+def test_nonsense_measurements_are_refused(tmp_path, monkeypatch):
+    from enhancer import forecast
+
+    monkeypatch.setattr(forecast, "_state_dir", lambda: tmp_path)
+    forecast.record_measurement("m.pth", 0.0)
+    forecast.record_measurement("m.pth", float("inf"))
+    forecast.record_measurement("m.pth", -5.0)
+
+    assert forecast.load_measurements() == {}

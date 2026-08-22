@@ -8,14 +8,28 @@ The point is that a full feature can take many hours. Finding out the output
 was 4x larger than intended, or that the chosen model needs a day, is worth
 knowing before starting rather than after.
 
-Timings come from throughput measured on an RTX 3060 Laptop. They are honest
-estimates, not promises: expect them to be right to within about half, and
-trust the live frames-per-second readout once a render is actually going.
+The built-in numbers were measured on an RTX 3060 Laptop, which is the wrong
+machine for almost everybody. So the estimate calibrates itself: every finished
+render reports what it actually achieved, that is remembered per model, and
+later estimates use the real figure. A model never run here is scaled by how
+this machine compares to the reference on the models it has run.
+
+Until anything has been measured the reference numbers are used unchanged and
+the estimate says so. They are honest estimates either way, not promises: trust
+the live frames-per-second readout once a render is actually going.
 """
 
 from __future__ import annotations
 
+import json
+import logging
+import math
+import os
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 # Measured input megapixels per second, per model. Input pixels rather than
 # output, because most of the work in these networks happens at input
@@ -116,18 +130,115 @@ class Forecast:
         return f"{self.megabytes / 1024:.1f} GB"
 
 
-def throughput_for(model_name: str, arch: str = "") -> float:
-    """Input megapixels a second for a model, by name then architecture."""
+def _state_dir() -> Path:
+    """Where this machine's own measurements live.
+
+    Not beside the models: those travel with the application, and a figure
+    measured on one machine would be wrong on the next one to open the folder.
+    """
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    elif sys.platform == "darwin":
+        base = str(Path.home() / "Library" / "Application Support")
+    else:
+        base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "Enhancer"
+
+
+def measurements_path() -> Path:
+    return _state_dir() / "throughput.json"
+
+
+def load_measurements() -> dict[str, float]:
+    """Megapixels a second actually achieved on this machine, by model.
+
+    Never raises. A missing, unreadable or corrupt file simply means nothing
+    has been measured yet, which is the normal state on a first run.
+    """
+    try:
+        raw = json.loads(measurements_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(k): float(v) for k, v in raw.items()
+        if isinstance(v, (int, float)) and math.isfinite(float(v)) and float(v) > 0
+    }
+
+
+def record_measurement(model_name: str, megapixels_per_second: float) -> None:
+    """Remember what a finished render actually achieved.
+
+    Averaged with whatever is already stored rather than replacing it, so one
+    render that fought a game for the card does not become the new truth.
+    """
+    if not (megapixels_per_second > 0 and math.isfinite(megapixels_per_second)):
+        return
     stem = model_name.rsplit(".", 1)[0]
-    for key, value in MEASURED_MPPS.items():
+    known = load_measurements()
+    previous = known.get(stem)
+    known[stem] = (
+        megapixels_per_second if previous is None
+        else (previous + megapixels_per_second) / 2.0
+    )
+    try:
+        path = measurements_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(known, indent=2, sort_keys=True), encoding="utf-8")
+    except OSError as exc:  # a read-only home is not worth failing a render over
+        log.info("could not save the throughput measurement: %s", exc)
+
+
+def machine_ratio(measurements: dict[str, float] | None = None) -> float:
+    """How this machine compares with the reference, from what it has run.
+
+    The geometric mean over models measured here that the reference table also
+    knows. Geometric because these are ratios: a machine twice as fast on one
+    model and half as fast on another is, on balance, neither.
+
+    1.0 when nothing comparable has been measured — meaning "assume the
+    reference machine", which is the only honest default.
+    """
+    known = load_measurements() if measurements is None else measurements
+    ratios = [
+        known[stem] / MEASURED_MPPS[key]
+        for stem in known
+        for key in MEASURED_MPPS
+        if key.lower() == stem.lower() and MEASURED_MPPS[key] > 0
+    ]
+    if not ratios:
+        return 1.0
+    return math.exp(sum(math.log(r) for r in ratios) / len(ratios))
+
+
+def throughput_for(
+    model_name: str, arch: str = "", measurements: dict[str, float] | None = None
+) -> float:
+    """Input megapixels a second for a model on THIS machine.
+
+    A figure measured here wins outright. Otherwise the reference figure is
+    scaled by how this machine has compared on everything else it has run,
+    which is a far better guess than the reference number on a card that is
+    not an RTX 3060 Laptop.
+    """
+    stem = model_name.rsplit(".", 1)[0]
+    known = load_measurements() if measurements is None else measurements
+
+    for key, value in known.items():
         if key.lower() == stem.lower():
             return value
+
+    ratio = machine_ratio(known)
+    for key, value in MEASURED_MPPS.items():
+        if key.lower() == stem.lower():
+            return value * ratio
 
     haystack = f"{stem} {arch}".lower()
     for key, value in ARCH_MPPS.items():
         if key in haystack:
-            return value
-    return DEFAULT_MPPS
+            return value * ratio
+    return DEFAULT_MPPS * ratio
 
 
 def forecast(

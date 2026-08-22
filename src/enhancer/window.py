@@ -392,6 +392,7 @@ class MainWindow(QMainWindow):
         self.thread: QThread | None = None
         self.worker: Worker | None = None
         self._started_at = 0.0
+        self._frames_done = 0
         self.queue = RenderQueue()
         self.active_task: Task | None = None
         self._scan_type = "progressive"
@@ -1652,6 +1653,7 @@ class MainWindow(QMainWindow):
             self._append("Cancelling after the current frame...")
 
     def _on_progress(self, done: int, total: int) -> None:
+        self._frames_done = done
         if self.active_task is not None:
             self.active_task.done_frames, self.active_task.total_frames = done, total
             if done % 50 == 0:
@@ -1669,6 +1671,7 @@ class MainWindow(QMainWindow):
     def _on_finished(self, path: str) -> None:
         self._append(f"Done: {path}")
         self.status.setText("Finished.")
+        self._learn_throughput()
         # The source this render actually used, captured before the task is
         # finished and cleared. Using whatever is loaded now would pair one
         # film's original with another film's render — which a queue holding
@@ -1691,6 +1694,55 @@ class MainWindow(QMainWindow):
             self._load_comparison(result)
 
         self._start_next()
+
+    def _learn_throughput(self) -> None:
+        """Remember what this machine actually managed, for future estimates.
+
+        The built-in speed table was measured on one particular laptop card,
+        so on anybody else's machine every estimate starts out wrong. A render
+        that has just finished is a free, exact measurement of the real thing —
+        better than any benchmark, because it is the actual workload.
+
+        The stored figure is the bare model rate, so the restoration and
+        interpolation multipliers are divided back out; leaving them in would
+        have the forecast apply them a second time.
+        """
+        task = self.active_task
+        if task is None or self.profile is None or self._started_at <= 0:
+            return
+        elapsed = time.perf_counter() - self._started_at
+        frames = self._frames_done
+        # Short runs are mostly model loading, which is not throughput.
+        if elapsed < 20.0 or frames < 50:
+            return
+
+        megapixels = (self.profile.width * self.profile.height) / 1_000_000
+        if megapixels <= 0:
+            return
+
+        from .forecast import (
+            INTERPOLATION_COST,
+            RESTORATION_COST,
+            REFERENCE_MEGAPIXELS,
+            RESOLUTION_FALLOFF,
+            record_measurement,
+        )
+
+        req = task.request
+        rate = megapixels * frames / elapsed
+        if not req.no_restore and (
+            req.deblock or req.degrain or req.detail_retention or req.regrain
+        ):
+            rate *= RESTORATION_COST
+        if req.target_fps:
+            rate *= INTERPOLATION_COST
+        # Undo the resolution falloff too, so a figure measured at 1080p is
+        # comparable with the table, which is quoted at the reference size.
+        rate /= (REFERENCE_MEGAPIXELS / megapixels) ** RESOLUTION_FALLOFF
+
+        record_measurement(req.model.name, rate)
+        self._append(f"Measured {rate:.2f} MP/s on this machine; estimates updated.")
+        self._update_forecast()
 
     def _on_failed(self, message: str) -> None:
         self._append(message)
