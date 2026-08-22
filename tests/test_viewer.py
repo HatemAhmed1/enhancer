@@ -5,7 +5,10 @@ a point, the sampling filter, the pair surviving a mode change — plus the
 crash-avoidance cases: no pair, empty widget, mismatched shapes.
 """
 
+import gc
 import os
+import sys
+import weakref
 
 import numpy as np
 import pytest
@@ -316,3 +319,220 @@ def test_a_non_contiguous_array_is_accepted(view):
     view.set_pair(before[:, ::2], after[:, ::2])
     assert view.image_size().width() == 40
     render(view)
+
+
+# --- playback ----------------------------------------------------------------
+#
+# set_frame is the same contract as set_pair, pushed 24-60 times a second. The
+# widget no longer copies the pixels into a QPixmap, so two things have to hold
+# per frame: the view must not move, and the previous frame's numpy buffer must
+# be released — while the current one must not be, since the QImage on screen is
+# only a view of it.
+
+def moving_pair(width=200, height=150, phase=0):
+    """A bar that walks across the frame, so consecutive frames really differ."""
+    before = np.zeros((height, width, 3), np.uint8)
+    after = np.zeros((height, width, 3), np.uint8)
+    x = (phase * 17) % (width - 20)
+    before[:, x:x + 20] = 255
+    after[:, x:x + 20] = 128
+    return before, after
+
+
+def test_set_frame_preserves_zoom_pan_and_divider(view, qtbot):
+    view.show()
+    qtbot.waitExposed(view)
+    view.set_pair(*moving_pair(phase=0))
+    view.set_zoom(3.0)
+    view.set_divider(0.3)
+
+    canvas = view._canvas_rect()
+    probe = QPointF(canvas.x() + canvas.width() * 0.6, canvas.y() + canvas.height() * 0.4)
+    view.zoom_at(3.0, probe)          # leaves fit mode, fixes a pan
+    anchor = view.image_at(probe)
+
+    for phase in range(1, 25):
+        view.set_frame(*moving_pair(phase=phase))
+        assert view.zoom() == pytest.approx(3.0), f"zoom moved on frame {phase}"
+        assert view.divider() == pytest.approx(0.3), f"divider moved on frame {phase}"
+        here = view.image_at(probe)
+        assert here.x() == pytest.approx(anchor.x(), abs=1e-6), f"panned on {phase}"
+        assert here.y() == pytest.approx(anchor.y(), abs=1e-6), f"panned on {phase}"
+
+
+def test_set_frame_keeps_the_mode(view, qtbot):
+    view.show()
+    qtbot.waitExposed(view)
+    view.set_pair(*moving_pair())
+    for mode in ("split", "toggle", "swipe"):
+        view.set_mode(mode)
+        for phase in range(5):
+            view.set_frame(*moving_pair(phase=phase))
+            assert view.mode() == mode
+        render(view)
+
+
+def test_set_frame_refuses_mismatched_dimensions(view):
+    view.set_pair(*make_pair(64, 48))
+    before, _ = make_pair(64, 48)
+    other, _ = make_pair(32, 24)
+    with pytest.raises(ValueError, match="identical dimensions"):
+        view.set_frame(before, other)
+
+
+def test_set_frame_refuses_non_uint8(view):
+    view.set_pair(*make_pair())
+    before, after = make_pair()
+    with pytest.raises(ValueError, match="uint8"):
+        view.set_frame(before.astype(np.float32), after.astype(np.float32))
+
+
+def test_a_rejected_frame_leaves_the_previous_pair_intact(view, qtbot):
+    """Validation happens before either image is installed, so nothing is torn."""
+    view.show()
+    qtbot.waitExposed(view)
+    view.set_pair(*make_pair(120, 90))
+    size = view.image_size()
+
+    good, _ = make_pair(64, 48)
+    _, bad = make_pair(32, 24)
+    with pytest.raises(ValueError):
+        view.set_frame(good, bad)
+
+    assert view.image_size() == size, "a refused frame must not replace the pair"
+    render(view)  # the two images must still agree, or this would paint garbage
+
+
+def test_pushing_many_frames_does_not_retain_them(view, qtbot):
+    """Only the pair on screen is held; every earlier frame is released.
+
+    The QImages are views over these arrays and copy nothing, so the widget has
+    to hold the current pair (drop it and Qt paints freed memory) and must hold
+    nothing else (hold them all and playback leaks 50 MB a second at 4K).
+    """
+    view.show()
+    qtbot.waitExposed(view)
+
+    # Weak references rather than getrefcount arithmetic: the question is
+    # simply whether the array is still alive once this test lets go of it.
+    seen = []
+    for phase in range(30):
+        before, after = moving_pair(phase=phase)
+        seen.append((weakref.ref(before), weakref.ref(after)))
+        view.set_frame(before, after)
+        del before, after
+    gc.collect()
+
+    alive = [
+        phase
+        for phase, (before, after) in enumerate(seen)
+        if before() is not None or after() is not None
+    ]
+    assert alive == [29], f"only the frame on screen may be retained, got {alive}"
+
+    # And it is the array that was handed over, not a copy of it: that is what
+    # makes the retention a correctness requirement rather than a leak.
+    last_before, last_after = seen[-1][0](), seen[-1][1]()
+    assert view._before_buffer is last_before
+    assert view._after_buffer is last_after
+    assert sys.getrefcount(last_before) > 2
+
+    # The attribute is replaced, never appended to.
+    view.set_frame(*moving_pair(phase=99))
+    assert view._before_buffer is not last_before
+    del last_before, last_after
+    gc.collect()
+    assert seen[-1][0]() is None, "the superseded frame must be released"
+
+
+def test_set_frame_survives_a_size_change(view, qtbot):
+    """A reel boundary is the one time a refit is right, and must not crash."""
+    view.show()
+    qtbot.waitExposed(view)
+    view.set_pair(*moving_pair(200, 150))
+    view.set_zoom(3.0)
+    view.set_frame(*moving_pair(400, 300))
+    assert view.image_size().width() == 400
+    assert view.zoom() < 3.0, "a genuinely different size has no pan to keep"
+    render(view)
+
+
+def test_playback_flag_round_trips(view):
+    assert not view.is_playing()
+    view.set_playing(True)
+    assert view.is_playing()
+    view.set_playing(True)      # idempotent
+    assert view.is_playing()
+    view.set_playing(False)
+    assert not view.is_playing()
+
+
+def test_clear_stops_playback(view):
+    view.set_pair(*make_pair())
+    view.set_playing(True)
+    view.clear()
+    assert not view.is_playing()
+    assert not view.has_pair()
+
+
+def test_the_chips_and_caption_stay_visible_while_playing(view, qtbot):
+    view.show()
+    qtbot.waitExposed(view)
+    view.set_mode("toggle")
+    view.set_pair(*moving_pair(200, 150))
+    view.fit()
+    view.set_playing(True)
+
+    for phase in range(10):
+        view.set_frame(*moving_pair(200, 150, phase=phase))
+    assert "200" in view.caption.text() and "150" in view.caption.text()
+
+    # The chip is drawn onto the picture, so look for its light text on the
+    # dark rounded plate in the top-left of where the picture landed.
+    image = render(view).toImage()
+    picture = view._picture_rect(view._canvas_rect())
+    chip = {
+        image.pixel(x, y)
+        for y in range(int(picture.y()) + 12, int(picture.y()) + 30)
+        for x in range(int(picture.x()) + 12, int(picture.x()) + 70)
+    }
+    assert len(chip) > 2, "the After chip should still be drawn during playback"
+
+
+def test_a_read_only_array_is_still_taken_without_copying(view, qtbot):
+    """Held source frames arrive with write=False, and must stay zero-copy.
+
+    The playback driver caches the enlarged 'before' across the 60% of pairs
+    that share a source frame and marks it read-only so no consumer can scribble
+    on it. If that made the widget copy — or raise — the whole point of dropping
+    the QPixmap would be lost on the commonest frame of all.
+    """
+    view.show()
+    qtbot.waitExposed(view)
+    before, after = make_pair(200, 150, seed=11)
+    before.setflags(write=False)
+
+    view.set_pair(before, after)
+    assert view._before_buffer is before, "a read-only frame must not be copied"
+
+    for _ in range(5):
+        view.set_frame(before, after)
+        assert view._before_buffer is before
+    render(view)
+
+
+def test_a_pushed_frame_actually_reaches_the_screen(view, qtbot):
+    """Consecutive frames must paint differently, or playback is a still image."""
+    view.show()
+    qtbot.waitExposed(view)
+    view.set_mode("toggle")
+    view.set_pair(*moving_pair(200, 150, phase=0))
+    view.fit()
+
+    renders = []
+    for phase in range(4):
+        view.set_frame(*moving_pair(200, 150, phase=phase))
+        renders.append(render(view).toImage())
+
+    for phase in range(1, 4):
+        assert renders[phase] != renders[phase - 1], f"frame {phase} did not repaint"
