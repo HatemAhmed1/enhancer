@@ -498,3 +498,197 @@ def test_dual_pass_can_use_different_models_per_pass(tmp_path, synthetic_clip):
         segment_frames=20, settings={"scale": 2},
     )
     assert SourceProfile.probe(final).width == 320 * 2 * 3
+
+
+def test_pass_two_hashes_its_own_model(tmp_path, synthetic_clip):
+    """Interrupting during pass two and restarting with a different
+    --pass2-model resumed happily, splicing two models together — the exact
+    seam the digest exists to prevent."""
+    from enhancer.cli import render_dual_pass
+    from enhancer.jobs import SettingsMismatch
+
+    profile = SourceProfile.probe(synthetic_clip)
+    job_dir = tmp_path / "job"
+    render_dual_pass(
+        profile, DoublingUpscaler(), DoublingUpscaler(),
+        output=tmp_path / "out.mkv", job_dir=job_dir,
+        segment_frames=20, settings={"scale": 2}, second_model_name="fast.pth",
+    )
+
+    with pytest.raises(SettingsMismatch):
+        render_dual_pass(
+            profile, DoublingUpscaler(), DoublingUpscaler(),
+            output=tmp_path / "out.mkv", job_dir=job_dir,
+            segment_frames=20, settings={"scale": 2},
+            second_model_name="something_else.pth",
+        )
+
+
+def test_pass_two_resumes_with_the_same_model(tmp_path, synthetic_clip):
+    """The guard must not cost a legitimate dual-pass resume."""
+    from enhancer.cli import render_dual_pass
+
+    profile = SourceProfile.probe(synthetic_clip)
+    job_dir = tmp_path / "job"
+    for _ in range(2):
+        render_dual_pass(
+            profile, DoublingUpscaler(), DoublingUpscaler(),
+            output=tmp_path / "out.mkv", job_dir=job_dir,
+            segment_frames=20, settings={"scale": 2}, second_model_name="fast.pth",
+        )
+    assert len(list(Decoder(SourceProfile.probe(tmp_path / "out.mkv")).frames())) == 50
+
+
+# --- output safety ----------------------------------------------------------
+
+
+def test_render_refuses_an_output_that_is_the_source(tmp_path, synthetic_clip):
+    """A case-only difference is the same file on Windows, and ffmpeg's own
+    guard is a string comparison that misses it. The source is read as it is
+    overwritten, so nothing can be recovered."""
+    import os
+
+    from enhancer.segments import OutputCollision
+
+    if os.path.normcase("A") != os.path.normcase("a"):
+        pytest.skip("case-sensitive filesystem")
+
+    profile = SourceProfile.probe(synthetic_clip)
+    before = synthetic_clip.read_bytes()
+    shouty = synthetic_clip.parent / synthetic_clip.name.upper()
+
+    with pytest.raises(OutputCollision):
+        render_resumable(
+            profile, DoublingUpscaler(), shouty,
+            job_dir=tmp_path / "job", segment_frames=20, settings={"scale": 2},
+        )
+    assert synthetic_clip.read_bytes() == before, "the source film must survive"
+
+
+def test_render_refuses_an_output_that_is_the_source_by_exact_path(tmp_path, synthetic_clip):
+    from enhancer.segments import OutputCollision
+
+    profile = SourceProfile.probe(synthetic_clip)
+    with pytest.raises(OutputCollision):
+        render_resumable(
+            profile, DoublingUpscaler(), synthetic_clip,
+            job_dir=tmp_path / "job", segment_frames=20, settings={"scale": 2},
+        )
+
+
+def test_render_refuses_a_job_directory_from_a_different_source(tmp_path, synthetic_clip):
+    """The reported failure: a finished job re-concatenated the first film's
+    segments for an entirely different source and reported success."""
+    import subprocess as sp
+
+    from enhancer.jobs import SourceMismatch
+
+    red = tmp_path / "red.mp4"
+    sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+            "-i", "color=c=red:size=320x240:rate=25:duration=2",
+            "-pix_fmt", "yuv420p", str(red)], check=True)
+
+    out = tmp_path / "out.mkv"
+    job_dir = tmp_path / "out.job"
+    render_resumable(
+        SourceProfile.probe(synthetic_clip), DoublingUpscaler(), out,
+        job_dir=job_dir, segment_frames=20, settings={"scale": 2},
+    )
+    with pytest.raises(SourceMismatch):
+        render_resumable(
+            SourceProfile.probe(red), DoublingUpscaler(), out,
+            job_dir=job_dir, segment_frames=20, settings={"scale": 2},
+        )
+
+
+def test_render_refuses_when_the_source_was_replaced_in_place(tmp_path, synthetic_clip):
+    """Render a film, replace the file with a better rip, render again to the
+    same name: the path is identical, so only size and time catch it."""
+    import os
+    import subprocess as sp
+
+    from enhancer.jobs import SourceMismatch
+
+    out = tmp_path / "out.mkv"
+    job_dir = tmp_path / "out.job"
+    render_resumable(
+        SourceProfile.probe(synthetic_clip), DoublingUpscaler(), out,
+        job_dir=job_dir, segment_frames=20, settings={"scale": 2},
+    )
+
+    sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+            "-i", "color=c=red:size=320x240:rate=25:duration=2",
+            "-pix_fmt", "yuv420p", str(synthetic_clip)], check=True)
+    os.utime(synthetic_clip, (0, 0))
+
+    with pytest.raises(SourceMismatch):
+        render_resumable(
+            SourceProfile.probe(synthetic_clip), DoublingUpscaler(), out,
+            job_dir=job_dir, segment_frames=20, settings={"scale": 2},
+        )
+
+
+def test_render_survives_an_apostrophe_in_the_output_path(tmp_path, synthetic_clip):
+    """Every account named O'Brien hit this on every render, at the last step,
+    after all the GPU work was already done."""
+    home = tmp_path / "O'Brien" / "films"
+    home.mkdir(parents=True)
+    out = home / "restored.mkv"
+    render_resumable(
+        SourceProfile.probe(synthetic_clip), DoublingUpscaler(), out,
+        job_dir=home / "restored.job", segment_frames=20, settings={"scale": 2},
+    )
+    result = SourceProfile.probe(out)
+    assert result.width == 640 and result.height == 480
+    assert len(list(Decoder(result).frames())) == 50
+
+
+# --- short decodes ----------------------------------------------------------
+
+
+def test_a_short_non_final_segment_is_rejected(tmp_path, synthetic_clip):
+    """write_segment already returned a frame count; nobody looked at it. A
+    decoder that stops early mid-film produced a truncated render that
+    reported success."""
+    from dataclasses import replace
+
+    profile = SourceProfile.probe(synthetic_clip)
+    # Claim far more frames than the file holds: segment 0 comes up short.
+    inflated = replace(profile, frame_count=200)
+    with pytest.raises(ValueError, match="is short"):
+        render_resumable(
+            inflated, DoublingUpscaler(), tmp_path / "out.mkv",
+            job_dir=tmp_path / "job", segment_frames=60, settings={"scale": 2},
+        )
+
+
+def test_a_slightly_over_counted_source_still_renders(tmp_path, synthetic_clip):
+    """MKV rarely carries nb_frames, so the probe falls back to
+    round(fps * duration) and over-counts by a frame or two on almost every
+    real source. That is an estimate being wrong, not a film being truncated:
+    the last segment is allowed to come up short."""
+    from dataclasses import replace
+
+    profile = SourceProfile.probe(synthetic_clip)
+    inflated = replace(profile, frame_count=51)   # 50 real frames
+    out = tmp_path / "out.mkv"
+    render_resumable(
+        inflated, DoublingUpscaler(), out,
+        job_dir=tmp_path / "job", segment_frames=20, settings={"scale": 2},
+    )
+    assert len(list(Decoder(SourceProfile.probe(out)).frames())) == 50
+
+
+def test_a_zero_frame_segment_is_rejected(tmp_path, synthetic_clip):
+    """It wrote a malformed 674-byte file that assemble accepted in silence."""
+    from dataclasses import replace
+
+    from enhancer.segments import EmptySegment
+
+    profile = SourceProfile.probe(synthetic_clip)
+    inflated = replace(profile, frame_count=100)   # 50 real frames
+    with pytest.raises(EmptySegment):
+        render_resumable(
+            inflated, DoublingUpscaler(), tmp_path / "out.mkv",
+            job_dir=tmp_path / "job", segment_frames=50, settings={"scale": 2},
+        )

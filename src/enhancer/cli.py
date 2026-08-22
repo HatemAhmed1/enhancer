@@ -11,7 +11,14 @@ from .bench import benchmark
 from .interpolate import render_from_plan
 from .jobs import JobState, SettingsMismatch
 from .models import load_model, scan_custom_dir
-from .segments import assemble, segment_path, write_segment
+from .requests import MAX_OUTPUT_FPS
+from .segments import (
+    OutputCollision,
+    assemble,
+    ensure_distinct_output,
+    segment_path,
+    write_segment,
+)
 from .timing import plan_output_frames
 from .upscale import Upscaler
 from .video_io import Decoder, SourceProfile
@@ -77,6 +84,10 @@ def render_resumable(
     settings = settings or {}
     scale = upscaler.scale
 
+    # Before anything is decoded, encoded or spent. Every caller reaches the
+    # engine through here, the desktop window included.
+    ensure_distinct_output(profile.path, output)
+
     if profile.frame_count <= 0:
         # Some containers report neither a frame count nor a duration. Without
         # one there is nothing to divide into segments, and the failure would
@@ -126,7 +137,7 @@ def render_resumable(
         segment_frames = min(segment_frames, cap)
 
     if (job_dir / "job.json").exists():
-        job = JobState.load(job_dir, settings=settings)
+        job = JobState.load(job_dir, settings=settings, source=profile.path)
     else:
         job = JobState.create(
             job_dir, source=str(profile.path), settings=settings,
@@ -193,11 +204,36 @@ def render_resumable(
                 if on_progress:
                     on_progress(start + i + 1, job.total_frames)
 
-        write_segment(
+        written = write_segment(
             segment_path(job_dir, index), processed(),
             width=out_w, height=out_h, fps=out_fps, source=profile,
         )
+        if written != count:
+            # A shortfall on the LAST segment is expected rather than alarming.
+            # MKV rarely carries nb_frames, so the probe falls back to
+            # round(fps * duration), which over-counts by a frame or two on
+            # almost every real source. The film is complete; the estimate was
+            # not. Anywhere else a shortfall means the decoder stopped early
+            # mid-film, and silently accepting it delivers a truncated render
+            # that reports success.
+            if index < job.segment_count - 1:
+                raise ValueError(
+                    f"segment {index} is short: {written} frames where "
+                    f"{count} were expected, starting at frame {start}. The "
+                    f"source stopped supplying frames partway through, which "
+                    f"usually means it is truncated or damaged at that point. "
+                    f"Check it with: ffmpeg -v error -i \"{profile.path}\" "
+                    f"-f null -"
+                )
         job.mark_complete(index)
+
+    if job.is_complete and Path(output).exists():
+        # Already assembled, and assembly is atomic, so the file being there
+        # means it finished. Re-running the concat would only rewrite an
+        # identical file — and rewriting it changes its modification time,
+        # which is exactly what tells the second pass of a dual render that its
+        # source is still the file it started on.
+        return Path(output)
 
     return assemble(job_dir, job.segment_count, output, profile)
 
@@ -211,6 +247,7 @@ def render_dual_pass(
     intermediate: str | Path | None = None,
     keep_intermediate: bool = True,
     on_progress=None,
+    second_model_name: str | None = None,
     **kwargs,
 ) -> tuple[Path, Path]:
     """Upscale in two stages with an inspectable file between them.
@@ -228,6 +265,12 @@ def render_dual_pass(
     Restoration and interpolation belong to the first pass only. Degraining an
     already-degrained frame flattens it further, and interpolating twice would
     compound synthesis errors, so `kwargs` are not forwarded to the second pass.
+
+    The second pass gets its own settings hash, naming its own model. Handing
+    it the first pass's hash made the two indistinguishable, so a job
+    interrupted during pass two would resume happily under a different
+    `--pass2-model` and splice two models together — the exact seam the digest
+    exists to prevent.
     """
     job_dir = Path(job_dir)
     output = Path(output)
@@ -254,11 +297,18 @@ def render_dual_pass(
         **kwargs,
     )
 
+    pass2_settings = dict(kwargs.get("settings") or {})
+    pass2_settings.update({
+        "pass": 2,
+        "pass2_model": second_model_name or getattr(second_upscaler, "name", None),
+        "pass2_scale": getattr(second_upscaler, "scale", None),
+    })
+
     mid_profile = SourceProfile.probe(intermediate)
     render_resumable(
         mid_profile, second_upscaler, output,
         job_dir=job_dir / "pass2",
-        settings=kwargs.get("settings"),
+        settings=pass2_settings,
         segment_frames=kwargs.get("segment_frames", DEFAULT_SEGMENT_FRAMES),
         on_progress=pass_progress(1),
     )
@@ -307,6 +357,18 @@ def resolve_target_fps(
             f"Target rate {target:g} is below the source rate {src_fps:.3f}; "
             f"this tool interpolates but does not decimate."
         )
+    if target > MAX_OUTPUT_FPS:
+        # Unbounded, --fps 100000 on a two-second clip is two hundred thousand
+        # synthesized frames: it accepts the flag and then simply never
+        # finishes, with no indication that the number was the problem.
+        return None, (
+            f"Target rate {target:g} is above the {MAX_OUTPUT_FPS:g} fps limit. "
+            f"Every frame above the source rate has to be synthesized, so the "
+            f"render time rises in proportion: at {target:g} fps this would "
+            f"take {target / max(src_fps, 1e-6):.0f} times longer than a plain "
+            f"upscale and produce a file nothing can play. Common targets are "
+            f"48, 50, 60 and 120."
+        )
     if not have_weights:
         from .rife import RIFE_DIR
 
@@ -317,10 +379,57 @@ def resolve_target_fps(
     return target, None
 
 
+def _preflight_message(model: str | Path, output: str | Path | None) -> str | None:
+    """What stops this machine rendering, in the user's terms, or None.
+
+    Without this the commonest failure of all — no ffmpeg on PATH — arrives as
+    a fifteen-line traceback ending in `FileNotFoundError: [WinError 2]`, which
+    never mentions ffmpeg at all.
+    """
+    from .preflight import blocking, check_all, summary
+
+    model = Path(model)
+
+    # Hardware detection probes ffmpeg and logs the failure with a stack trace.
+    # Here that failure is the answer being looked for, not an incident, and a
+    # traceback printed just above the plain-English explanation undoes the
+    # whole point of asking.
+    system_log = logging.getLogger("enhancer.system")
+    previous = system_log.level
+    system_log.setLevel(logging.ERROR)
+    try:
+        requirements = check_all(model.parent, output)
+    finally:
+        system_log.setLevel(previous)
+
+    if model.exists():
+        # The model was named outright, so whether the shared models folder
+        # happens to hold anything is beside the point.
+        requirements = [r for r in requirements if r.name != "Models"]
+
+    stoppers = blocking(requirements)
+    if not stoppers:
+        return None
+    names = ", ".join(r.name for r in stoppers)
+    return f"{summary(stoppers)}\n\nCannot render: {names}."
+
+
 def _run_image(args: argparse.Namespace) -> int:
     """Upscale a still. Images have no frame rate, segments or audio."""
     from .images import upscale_image
     from .restore import RestoreSettings, TexturePost
+
+    ensure_distinct_output(args.input, args.output)
+
+    if not args.no_restore and (args.deblock > 0 or args.degrain > 0):
+        # Both run inside ffmpeg's decode filter chain, which a still never
+        # goes through. Saying nothing left the settings looking applied.
+        print(
+            f"Note: --deblock ({args.deblock:g}) and --degrain ({args.degrain:g}) "
+            f"are video-only filters, applied while decoding a stream. This "
+            f"still is upscaled without them; --detail-retention and --regrain "
+            f"do apply."
+        )
 
     device = select_device(prefer_cuda=not args.cpu)
     model = load_model(Path(args.model), device=device, half=not args.cpu)
@@ -343,16 +452,72 @@ def _run_image(args: argparse.Namespace) -> int:
     return 0
 
 
+def _has_journal(job_dir: Path) -> bool:
+    """True when this program already owns an unfinished render for an output.
+
+    That is what separates a resume, which legitimately writes over its own
+    output, from a second render landing on somebody's finished film. The
+    journal is the proof of ownership: it records the source, the settings and
+    which segments are done, and `JobState.load` refuses it if any of that
+    disagrees with what is being asked for now. So a journal here means "this
+    output is mine and I am mid-way through it", which is exactly the case that
+    must not need a flag.
+
+    A dual pass keeps its journals one level down, in `pass1` and `pass2`, so
+    both depths count.
+    """
+    if not job_dir.is_dir():
+        return False
+    return (job_dir / "job.json").exists() or any(job_dir.glob("*/job.json"))
+
+
+def _overwrite_message(output: Path, job_dir: Path | None) -> str:
+    lines = [
+        f"{output} already exists.",
+        "",
+        "Rendering there would replace it, and a finished render is usually "
+        "hours of work.",
+    ]
+    if job_dir is not None:
+        lines.append(
+            f"This is not a resume either: there is no job journal in "
+            f"{job_dir}, so nothing here knows how that file was made or has "
+            f"anything left of it."
+        )
+    lines += ["", "Pass --force to replace it, or choose another output path."]
+    return "\n".join(lines)
+
+
 def cmd_video(args: argparse.Namespace) -> int:
     from .analyze import ScanType, classify_scan, probe_scan
     from .images import is_image
     from .restore import RestoreSettings, TexturePost, build_filter_chain
 
+    output = Path(args.output)
+    try:
+        ensure_distinct_output(args.input, output)
+    except OutputCollision as exc:
+        print(exc)
+        return 4
+
     if is_image(args.input):
         if args.fps is not None or args.interpolate is not None:
             print("Frame rate conversion does not apply to a still image.")
             return 3
+        if output.exists() and not args.force:
+            print(_overwrite_message(output, None))
+            return 4
         return _run_image(args)
+
+    unmet = _preflight_message(args.model, output)
+    if unmet:
+        print(unmet)
+        return 1
+
+    job_dir = Path(args.job_dir) if args.job_dir else output.with_suffix(".job")
+    if output.exists() and not args.force and not _has_journal(job_dir):
+        print(_overwrite_message(output, job_dir))
+        return 4
 
     profile = SourceProfile.probe(args.input)
 
@@ -400,14 +565,23 @@ def cmd_video(args: argparse.Namespace) -> int:
 
         flow_model = load_rife(rife_weights()[0], device=device)
 
+    scene_threshold = (
+        DEFAULT_SCENE_THRESHOLD if args.scene_threshold is None else args.scene_threshold
+    )
+
     # Every restoration setting that can change the pixels goes into the job
     # hash, including the derived filter string itself: changing any of these
     # between runs against the same job directory must refuse to resume
     # rather than splice together footage processed two different ways.
+    #
+    # Only *resolved* values go in, never the raw arguments. `--scene-threshold
+    # 0.30` and leaving it unset are the same render, and hashing the argument
+    # made one refuse to resume the other. `tile` is left out entirely: see
+    # RenderRequest.settings_dict for why. The source is checked by the journal
+    # rather than hashed here, so that the refusal can name the film.
     settings = {
         "model": Path(args.model).name,
         "scale": model.scale,
-        "tile": tile,
         "overlap": args.overlap,
         "cpu": bool(args.cpu),
         "no_restore": bool(args.no_restore),
@@ -419,9 +593,8 @@ def cmd_video(args: argparse.Namespace) -> int:
         "field_order": field_order,
         "video_filter": video_filter,
         "target_fps": target_fps,
-        "scene_threshold": args.scene_threshold,
+        "scene_threshold": scene_threshold,
     }
-    job_dir = Path(args.job_dir) if args.job_dir else Path(args.output).with_suffix(".job")
 
     print(f"{profile.width}x{profile.height} -> {profile.width * model.scale}x"
           f"{profile.height * model.scale}, {profile.frame_count} frames, tile={tile}")
@@ -436,10 +609,6 @@ def cmd_video(args: argparse.Namespace) -> int:
         if done % 50 == 0:
             print(f"\r{done}/{total}", end="", flush=True)
 
-    scene_threshold = (
-        DEFAULT_SCENE_THRESHOLD if args.scene_threshold is None else args.scene_threshold
-    )
-
     try:
         if args.dual_pass:
             second_path = Path(args.pass2_model) if args.pass2_model else Path(args.model)
@@ -453,7 +622,7 @@ def cmd_video(args: argparse.Namespace) -> int:
             mid, _final = render_dual_pass(
                 profile, up, second, args.output, job_dir=job_dir,
                 keep_intermediate=not args.discard_intermediate,
-                on_progress=progress,
+                on_progress=progress, second_model_name=second_path.name,
                 segment_frames=args.segment_frames, settings=settings,
                 video_filter=video_filter, texture=texture,
                 interpolate_to=target_fps, flow_model=flow_model,
@@ -472,6 +641,9 @@ def cmd_video(args: argparse.Namespace) -> int:
     except SettingsMismatch as exc:
         print(f"\nCannot resume: {exc}")
         return 2
+    except OutputCollision as exc:
+        print(f"\n{exc}")
+        return 4
     except ValueError as exc:
         print(f"\n{exc}")
         return 3
@@ -678,6 +850,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="delete the intermediate once the second pass finishes")
     v.add_argument("--no-restore", action="store_true",
                     help="skip all restoration and texture work")
+    v.add_argument("-f", "--force", action="store_true",
+                    help="replace the output file if it already exists "
+                         "(resuming an interrupted render never needs this)")
     v.set_defaults(func=cmd_video)
 
     a = sub.add_parser("analyze", help="inspect a source's scan type, grain, and compression")

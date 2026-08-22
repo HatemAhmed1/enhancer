@@ -35,10 +35,20 @@ def test_explicit_job_dir_is_respected():
 def test_settings_dict_includes_every_pixel_affecting_choice():
     keys = set(_req().settings_dict(scale=2, tile=512, video_filter="hqdn3d=1:1:1:1"))
     for expected in (
-        "model", "scale", "tile", "deblock", "degrain",
+        "model", "scale", "overlap", "deblock", "degrain",
         "detail_retention", "regrain", "target_fps", "video_filter",
     ):
         assert expected in keys
+
+
+def test_tile_is_not_in_the_job_hash():
+    """Tile comes from whatever graphics memory is free at the moment, and the
+    out-of-memory runner already changes it mid-render. Hashing it made the
+    same command refuse to resume itself with a browser open."""
+    a = _req().settings_dict(scale=2, tile=512, video_filter="")
+    b = _req().settings_dict(scale=2, tile=256, video_filter="")
+    assert a == b
+    assert "tile" not in a
 
 
 def test_settings_dict_changes_when_a_slider_moves():
@@ -104,6 +114,20 @@ def test_target_fps_equal_to_source_is_accepted():
 
 def test_validation_passes_when_no_interpolation_requested():
     _req().validate_against(src_fps=60.0)
+
+
+def test_absurd_target_fps_is_rejected():
+    """--fps 100000 on a two-second clip was still grinding ten minutes later."""
+    from enhancer.requests import MAX_OUTPUT_FPS
+
+    with pytest.raises(ValueError, match="limit"):
+        _req(target_fps=100000.0).validate_against(src_fps=25.0)
+    _req(target_fps=MAX_OUTPUT_FPS).validate_against(src_fps=25.0)
+
+
+def test_ordinary_high_frame_rates_are_still_allowed():
+    for rate in (48.0, 50.0, 60.0, 120.0):
+        _req(target_fps=rate).validate_against(src_fps=24.0)
 
 
 def test_string_paths_are_coerced():

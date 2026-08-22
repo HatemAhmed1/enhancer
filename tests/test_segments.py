@@ -1,3 +1,4 @@
+import os
 import subprocess
 
 import numpy as np
@@ -5,8 +6,13 @@ import pytest
 
 from enhancer.jobs import JobState
 from enhancer.segments import (
+    EmptySegment,
+    OutputCollision,
     assemble,
     completed_segment_paths,
+    concat_line,
+    ensure_distinct_output,
+    same_file,
     segment_path,
     write_segment,
 )
@@ -130,3 +136,126 @@ def test_assemble_muxes_audio_exactly_once(tmp_path, synthetic_clip_with_audio):
     assert abs(final_duration - source_duration) < 0.2, (
         f"expected assembled duration near {source_duration:.2f}s, got {final_duration:.2f}s"
     )
+
+
+# --- the output must never be the source ------------------------------------
+
+
+def _case_folds():
+    return os.path.normcase("A") == os.path.normcase("a")
+
+
+def test_same_file_recognises_an_exact_path(tmp_path):
+    p = tmp_path / "film.mp4"
+    p.write_bytes(b"x")
+    assert same_file(p, p)
+
+
+def test_same_file_separates_two_genuinely_different_files(tmp_path):
+    a, b = tmp_path / "a.mp4", tmp_path / "b.mp4"
+    a.write_bytes(b"x")
+    b.write_bytes(b"y")
+    assert not same_file(a, b)
+
+
+@pytest.mark.skipif(not _case_folds(), reason="case-sensitive filesystem")
+def test_same_file_sees_through_a_case_difference(tmp_path):
+    """ffmpeg's own guard is a string comparison and misses this entirely."""
+    src = tmp_path / "CASEDEMO.mp4"
+    src.write_bytes(b"the only copy")
+    assert same_file(src, tmp_path / "casedemo.mp4")
+
+
+def test_same_file_sees_through_a_hard_link(tmp_path):
+    src = tmp_path / "film.mp4"
+    src.write_bytes(b"the only copy")
+    link = tmp_path / "elsewhere.mp4"
+    try:
+        os.link(src, link)
+    except (OSError, NotImplementedError, AttributeError):
+        pytest.skip("hard links unavailable here")
+    assert same_file(src, link)
+
+
+@pytest.mark.skipif(not _case_folds(), reason="case-sensitive filesystem")
+def test_ensure_distinct_output_refuses_a_case_only_difference(tmp_path):
+    """The whole film is lost otherwise: the source is read as it is
+    overwritten, and the run reports success."""
+    src = tmp_path / "CASEDEMO.mp4"
+    src.write_bytes(b"the only copy")
+    with pytest.raises(OutputCollision, match="same file as the source"):
+        ensure_distinct_output(src, tmp_path / "casedemo.mp4")
+
+
+def test_ensure_distinct_output_allows_a_different_name(tmp_path):
+    src = tmp_path / "film.mp4"
+    src.write_bytes(b"x")
+    ensure_distinct_output(src, tmp_path / "film_4k.mkv")
+
+
+@pytest.mark.skipif(not _case_folds(), reason="case-sensitive filesystem")
+def test_assemble_refuses_to_overwrite_its_own_source(tmp_path, synthetic_clip):
+    """Last line of defence: this is the moment the damage would be done."""
+    profile = SourceProfile.probe(synthetic_clip)
+    frames = list(Decoder(profile).frames())[:5]
+    write_segment(segment_path(tmp_path, 0), iter(frames),
+                  width=320, height=240, fps=25.0, source=profile)
+
+    digest_before = synthetic_clip.read_bytes()
+    target = synthetic_clip.parent / synthetic_clip.name.upper()
+    with pytest.raises(OutputCollision):
+        assemble(tmp_path, count=1, output=target, source=profile)
+    assert synthetic_clip.read_bytes() == digest_before, "the source must survive"
+
+
+# --- concat listing escaping -------------------------------------------------
+
+
+def test_concat_line_escapes_an_apostrophe(tmp_path):
+    """Every Windows account named O'Brien, D'Souza or N'Diaye has one in the
+    default output path, and the render died at the very last step."""
+    line = concat_line(tmp_path / "O'Brien.mkv")
+    assert "'\\''" in line
+    assert line.endswith("'\n")
+
+
+def test_concat_line_leaves_ordinary_paths_alone(tmp_path):
+    line = concat_line(tmp_path / "plain.mkv")
+    assert "\\" not in line
+    assert line.startswith("file '") and line.endswith("'\n")
+
+
+def test_assemble_works_from_a_directory_with_an_apostrophe(synthetic_clip, tmp_path):
+    """Run it for real: the failure only ever showed up in ffmpeg."""
+    home = tmp_path / "O'Brien"
+    home.mkdir()
+    profile = SourceProfile.probe(synthetic_clip)
+    frames = list(Decoder(profile).frames())
+    write_segment(segment_path(home, 0), iter(frames[:25]),
+                  width=320, height=240, fps=25.0, source=profile)
+    write_segment(segment_path(home, 1), iter(frames[25:50]),
+                  width=320, height=240, fps=25.0, source=profile)
+
+    final = home / "restored.mkv"
+    assemble(home, count=2, output=final, source=profile)
+    assert len(list(Decoder(SourceProfile.probe(final)).frames())) == 50
+
+
+# --- empty segments ----------------------------------------------------------
+
+
+def test_write_segment_refuses_to_finalise_an_empty_segment(tmp_path, synthetic_clip):
+    """A zero-frame segment still writes a few hundred bytes of container
+    header, which assemble accepted without a word."""
+    profile = SourceProfile.probe(synthetic_clip)
+    out = segment_path(tmp_path, 0)
+    with pytest.raises(EmptySegment):
+        write_segment(out, iter([]), width=320, height=240, fps=25.0, source=profile)
+    assert not out.exists()
+    assert list(tmp_path.glob("*.part*")) == []
+
+
+def test_completed_segment_paths_rejects_an_empty_file(tmp_path):
+    segment_path(tmp_path, 0).write_bytes(b"")
+    with pytest.raises(EmptySegment):
+        completed_segment_paths(tmp_path, count=1)

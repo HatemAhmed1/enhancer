@@ -7,6 +7,12 @@ from pathlib import Path
 
 PREVIEW_SUFFIX = ".preview"
 
+# Nothing plays above this, and the cost is linear in it: a two-second clip at
+# 100000 fps is two hundred thousand synthesized frames, which is a longer
+# render than the feature film this tool exists for. Well above every real
+# target (240 covers high-frame-rate displays and slow-motion masters).
+MAX_OUTPUT_FPS = 240.0
+
 
 def _check(name: str, value: float) -> None:
     if not 0.0 <= value <= 1.0:
@@ -81,13 +87,32 @@ class RenderRequest:
                 f"target rate {self.target_fps:g} is below the source rate "
                 f"{src_fps:.3f}; this tool interpolates but does not decimate"
             )
+        if self.target_fps is not None and self.target_fps > MAX_OUTPUT_FPS:
+            raise ValueError(
+                f"target rate {self.target_fps:g} is above the {MAX_OUTPUT_FPS:g} "
+                f"fps limit; every frame above the source rate has to be "
+                f"synthesized, so the render time rises with it"
+            )
 
     def settings_dict(self, scale: int, tile: int, video_filter: str) -> dict:
-        """The job hash input: everything that can change output pixels."""
+        """The job hash input: everything that can change output pixels.
+
+        `tile` is accepted for call compatibility and deliberately left out.
+        It is chosen from whatever graphics memory happens to be free, so the
+        same command picks a different tile with a browser open — and refusing
+        to resume for that reason costs hours. It is also not a stable input to
+        begin with: the out-of-memory runner already steps the tile up and down
+        *within* a single render, so pinning it in the hash would guarantee
+        nothing anyway. `overlap`, which is what actually governs how much
+        context each tile sees, stays in.
+
+        The source is not in here either. It is checked separately, by the
+        journal itself, so that every caller gets the check and the refusal can
+        say which film the job directory belongs to.
+        """
         return {
             "model": self.model.name,
             "scale": scale,
-            "tile": tile,
             "overlap": self.overlap,
             "cpu": self.cpu,
             "no_restore": self.no_restore,
