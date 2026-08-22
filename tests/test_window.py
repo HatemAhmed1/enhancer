@@ -711,3 +711,42 @@ def test_comparing_is_blocked_while_a_render_holds_the_card(window, tmp_path):
 
     window._set_running(False)
     assert window.compare_button.isEnabled()
+
+
+def test_playback_decodes_only_what_the_pane_can_show(window):
+    """A 4K frame is 24.9 MB; sixty a second is 1.5 GB/s and manages about ten.
+
+    Fitted into a small pane, most of those rows are discarded before they are
+    seen, so they are never decoded. Measured: 9.8 to 74.8 frames a second.
+    """
+    window.view.resize(800, 472)
+    wanted = window._needed_decode_height()
+
+    assert wanted == 472, "should decode exactly what the pane shows"
+    assert wanted < 2160, "playing a fitted 4K clip at full resolution"
+
+
+def test_the_played_height_ignores_the_zoom(window):
+    """A magnified proxy would make the zoom readout mean something false.
+
+    At "100%" the user is entitled to one output pixel per screen pixel. A
+    stream decoded small and blown up cannot offer that, so playback stays a
+    fitted preview and Compare this frame remains the full-resolution tool.
+    """
+    import numpy as np
+
+    window.view.resize(800, 472)
+    frame = np.zeros((600, 900, 3), dtype=np.uint8)
+    window.view.set_pair(frame, frame.copy())
+
+    window.view.fit()
+    fitted = window._needed_decode_height()
+    window.view.set_zoom(4.0)
+
+    assert window._needed_decode_height() == fitted
+
+
+def test_a_tiny_pane_still_asks_for_a_usable_picture(window):
+    """A collapsed pane must not ask ffmpeg for a two-pixel-tall stream."""
+    window.view.resize(800, 10)
+    assert window._needed_decode_height() >= 240

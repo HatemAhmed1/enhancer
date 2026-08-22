@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -183,3 +185,21 @@ def test_the_pipe_buffer_does_not_scale_with_frame_size():
     uhd_frame_bytes = 3840 * 2160 * 3
     assert PIPE_BUFFER_BYTES < uhd_frame_bytes, "buffer would stall 4K decoding"
     assert PIPE_BUFFER_BYTES >= 1 << 16, "a tiny buffer costs a syscall per read"
+
+
+def test_a_resizing_filter_needs_its_output_size_declared():
+    """Without it the read loop pulls source-sized chunks from a scaled stream.
+
+    Every frame after the first is then torn, silently, because the reads and
+    the frame boundaries have drifted apart.
+    """
+    from enhancer.video_io import Decoder, SourceProfile
+
+    profile = SourceProfile(
+        path=Path("x.mp4"), width=3840, height=2160, fps=24.0, frame_count=10,
+        pix_fmt="yuv420p", sar="1:1", interlaced=False, field_order="tff",
+        color_primaries="", color_transfer="", color_space="", duration=1.0,
+    )
+    assert Decoder(profile).output_size == (3840, 2160)
+    scaled = Decoder(profile, video_filter="scale=-2:720", frame_size=(1280, 720))
+    assert scaled.output_size == (1280, 720)

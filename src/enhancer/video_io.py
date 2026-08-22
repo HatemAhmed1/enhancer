@@ -108,11 +108,23 @@ class Decoder:
         start_frame: int = 0,
         max_frames: int | None = None,
         video_filter: str = "",
+        frame_size: tuple[int, int] | None = None,
     ) -> None:
         self.profile = profile
         self.start_frame = start_frame
         self.max_frames = max_frames
         self.video_filter = video_filter
+        # Only needed when `video_filter` changes the picture's dimensions.
+        # The frame size otherwise comes from the profile, and a filter that
+        # resizes without saying so leaves the read loop pulling 4K-sized
+        # chunks out of a 720p stream: every frame after the first is torn.
+        self.frame_size = frame_size
+
+    @property
+    def output_size(self) -> tuple[int, int]:
+        if self.frame_size is not None:
+            return self.frame_size
+        return (self.profile.width, self.profile.height)
 
     def _command(self) -> list[str]:
         p = self.profile
@@ -137,8 +149,8 @@ class Decoder:
         return cmd
 
     def frames(self) -> Iterator[np.ndarray]:
-        p = self.profile
-        frame_bytes = p.width * p.height * 3
+        width, height = self.output_size
+        frame_bytes = width * height * 3
         # A fixed, modest buffer. Sizing it to the frame made it 99 MB at 4K,
         # and Python's buffered reader refills the whole thing before handing
         # back the first frame: the same clip ffmpeg decodes at 171 fps came
@@ -154,7 +166,7 @@ class Decoder:
                 if len(buf) < frame_bytes:
                     drained = True
                     break
-                yield np.frombuffer(buf, np.uint8).reshape(p.height, p.width, 3)
+                yield np.frombuffer(buf, np.uint8).reshape(height, width, 3)
         finally:
             if not drained and process.poll() is None:
                 # Abandoned before the end: a seek, a cancelled render, a

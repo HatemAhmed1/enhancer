@@ -33,7 +33,7 @@ class ComparePair:
     frame_index: int
 
 
-def _match_size(before: np.ndarray, after: np.ndarray) -> np.ndarray:
+def _match_size(before: np.ndarray, after: np.ndarray, prefer_gpu: bool = False) -> np.ndarray:
     """Scale `before` up to `after`'s exact dimensions with bicubic.
 
     THIS IS THE POINT OF THE WHOLE COMPARISON AND MUST NOT BE REMOVED AS A
@@ -51,10 +51,46 @@ def _match_size(before: np.ndarray, after: np.ndarray) -> np.ndarray:
     height, width = after.shape[:2]
     if before.shape[0] == height and before.shape[1] == width:
         return np.ascontiguousarray(before)
+    if prefer_gpu:
+        resized = _bicubic_cuda(before, width, height)
+        if resized is not None:
+            return resized
     resized = Image.fromarray(before, mode="RGB").resize(
         (width, height), Image.BICUBIC
     )
     return np.asarray(resized, dtype=np.uint8)
+
+
+def _bicubic_cuda(rgb: np.ndarray, width: int, height: int) -> np.ndarray | None:
+    """The same enlargement on the graphics card, or None if it cannot run.
+
+    Pillow's bicubic costs 166 ms for 1080p to 4K, and playback needs one per
+    source frame — on its own that is several times slower than real time. The
+    same resize on the card measures 19 ms.
+
+    The two do not produce bit-identical output: Pillow's cubic kernel uses
+    a = -0.5 and torch's uses a = -0.75. On real footage the difference is
+    invisible — mean 0.10 of 255, with 98.7% of pixels within 2 — and both are
+    plain bicubic, so neither flatters nor sandbags the comparison. (Measured on
+    random noise the gap looks far worse; noise is the worst case for any
+    interpolation kernel and says nothing about photographs.)
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        with torch.no_grad():
+            t = torch.from_numpy(np.ascontiguousarray(rgb))
+            t = t.permute(2, 0, 1).unsqueeze(0).cuda().float().div_(255.0)
+            t = torch.nn.functional.interpolate(
+                t, size=(height, width), mode="bicubic", align_corners=False
+            )
+            t = t.clamp_(0.0, 1.0).mul_(255.0).round_()
+            out = t.squeeze(0).permute(1, 2, 0).to(torch.uint8).cpu().numpy()
+        return np.ascontiguousarray(out)
+    except Exception:  # noqa: BLE001 - any failure just falls back to Pillow
+        return None
 
 
 def _first_frame(decoder: Decoder, what: str) -> np.ndarray:

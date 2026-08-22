@@ -112,9 +112,17 @@ class ComparePlayer:
     which tears both pipes down and starts two new ones.
     """
 
-    def __init__(self, source: Path, output: Path) -> None:
+    def __init__(self, source: Path, output: Path, prefer_gpu: bool = True,
+                 decode_height: int | None = None) -> None:
         self.source = Path(source)
         self.output = Path(output)
+        # Enlarging the source frame on the card is nine times faster, which is
+        # most of the difference between playback that keeps up and playback
+        # that does not. Turned off while a render owns the card, so watching
+        # one clip cannot quietly slow the job that is producing the next.
+        self.prefer_gpu = prefer_gpu
+        # Height to decode at, or None for native. See _proxy().
+        self.decode_height = decode_height
 
         self._source_profile = _probe(self.source, "source")
         self._output_profile = _probe(self.output, "output")
@@ -294,7 +302,7 @@ class ComparePlayer:
         """
         shape = (after.shape[0], after.shape[1])
         if self._before is None or self._before_shape != shape:
-            scaled = _match_size(self._src_frame, after)
+            scaled = _match_size(self._src_frame, after, self.prefer_gpu)
             if scaled is self._src_frame:
                 # Same size already: _match_size hands the array straight back.
                 # Take a copy so the read-only cache and the held source frame
@@ -304,6 +312,31 @@ class ComparePlayer:
             self._before = scaled
             self._before_shape = shape
         return self._before
+
+    def _proxy(self, profile) -> dict:
+        """Decoder arguments for playing at less than full resolution.
+
+        Playback is limited by how many pixels cross the pipe, not by the
+        codec: a 4K frame is 24.9 MB, so sixty a second is 1.5 GB/s, and it
+        tops out near 20 fps. Hardware decoding does not help, because the cost
+        is the rgb24 conversion and the transfer rather than the decode itself.
+        Scaling inside ffmpeg first measures 102 fps on the same file.
+
+        Only ever downwards. Asking for more than the picture has would enlarge
+        it here and then present it as though it were real detail.
+        """
+        wanted = self.decode_height
+        if not wanted or wanted >= profile.height:
+            return {}
+        # Even dimensions, and -2 style aspect preservation done explicitly so
+        # the size is known here rather than having to be read back.
+        height = max(2, wanted - (wanted % 2))
+        width = max(2, round(profile.width * height / profile.height))
+        width -= width % 2
+        return {
+            "video_filter": f"scale={width}:{height}",
+            "frame_size": (width, height),
+        }
 
     def _restart(self, index: int) -> None:
         self._release()
@@ -315,8 +348,12 @@ class ComparePlayer:
             self._source_last,
         )
 
-        self._out_frames = Decoder(self._output_profile, start_frame=index).frames()
-        self._src_frames = Decoder(self._source_profile, start_frame=start).frames()
+        self._out_frames = Decoder(
+            self._output_profile, start_frame=index, **self._proxy(self._output_profile)
+        ).frames()
+        self._src_frames = Decoder(
+            self._source_profile, start_frame=start, **self._proxy(self._source_profile)
+        ).frames()
 
         self._index = index
         # Nothing decoded yet: the first pull lands on `start`.

@@ -201,17 +201,23 @@ class PlaybackWorker(QObject):
     ended = Signal()
     failed = Signal(str)
 
-    def __init__(self, source: Path, output: Path) -> None:
+    def __init__(self, source: Path, output: Path, prefer_gpu: bool = True,
+                 decode_height: int | None = None) -> None:
         super().__init__()
         self._source = source
         self._output = output
+        self._prefer_gpu = prefer_gpu
+        self._decode_height = decode_height
         self.player = None
 
     def open(self) -> None:
         try:
             from .playback import ComparePlayer
 
-            self.player = ComparePlayer(self._source, self._output)
+            self.player = ComparePlayer(
+                self._source, self._output, prefer_gpu=self._prefer_gpu,
+                decode_height=self._decode_height,
+            )
             self.player.open()
             start, end = self.player.covers
             self.opened.emit(
@@ -393,6 +399,7 @@ class MainWindow(QMainWindow):
         self._play_fps = 24.0
         self._play_duration = 0.0
         self._frame_in_flight = False
+        self._decode_height: int | None = None
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self._tick)
         self.theme_mode = theme.load_mode()
@@ -1352,6 +1359,25 @@ class MainWindow(QMainWindow):
 
     # --- playback -----------------------------------------------------------
 
+    def _needed_decode_height(self) -> int:
+        """How tall the played picture needs to be: what the pane can show.
+
+        Playback is limited by pixels crossing the pipe. A 4K frame is 24.9 MB,
+        so sixty a second is 1.5 GB/s, and it manages about ten — measured, and
+        neither hardware decoding nor a bigger buffer moves it, because the cost
+        is the rgb24 conversion and the transfer rather than the decode. Fitted
+        into a seven-hundred-pixel pane, seven eighths of those rows are thrown
+        away before they are ever seen. Not decoding them takes the same clip
+        from ten frames a second to seventy-five.
+
+        Deliberately not tied to the zoom. A stream decoded small and then
+        magnified would make the zoom readout a lie: "100%" would mean one
+        proxy pixel per screen pixel, not one output pixel. Playback answers
+        whether the motion holds up; Compare this frame answers whether the
+        texture does, at full resolution, and that is the one to zoom into.
+        """
+        return max(240, self.view.height())
+
     def _browse_comparison(self) -> None:
         name, _ = QFileDialog.getOpenFileName(
             self, "Choose a finished result", "",
@@ -1367,7 +1393,13 @@ class MainWindow(QMainWindow):
         self._stop_playback()
 
         self.play_thread = QThread(self)
-        self.play_worker = PlaybackWorker(self.source, path)
+        # A render owns the card while it runs; the resize would take a share
+        # of it and slow a job with hours left, for a clip being watched now.
+        self._decode_height = self._needed_decode_height()
+        self.play_worker = PlaybackWorker(
+            self.source, path, prefer_gpu=self.thread is None,
+            decode_height=self._decode_height,
+        )
         self.play_worker.moveToThread(self.play_thread)
         self.play_worker.opened.connect(self._on_playback_opened)
         self.play_worker.frame.connect(self._on_playback_frame)

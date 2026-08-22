@@ -215,11 +215,34 @@ def test_before_is_the_bicubic_enlargement_of_the_source_frame(
         Image.fromarray(raw).resize((640, 480), Image.BICUBIC), dtype=np.uint8
     )
 
-    with ComparePlayer(synthetic_clip, doubled_clip) as player:
+    with ComparePlayer(synthetic_clip, doubled_clip, prefer_gpu=False) as player:
         pair = player.next_pair()
 
     assert pair.before.shape == (480, 640, 3)
     assert np.array_equal(pair.before, expected)
+
+
+def test_the_card_gives_the_same_enlargement_as_pillow(synthetic_clip, doubled_clip):
+    """The fast path must stay the honest baseline, not merely a fast one.
+
+    Pillow's cubic kernel uses a = -0.5 and torch's a = -0.75, so the two are
+    not bit-identical. Both are plain bicubic, and on real footage the gap is
+    invisible; this pins that it stays a rounding difference rather than
+    drifting into a different filter.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA on this machine")
+
+    with ComparePlayer(synthetic_clip, doubled_clip, prefer_gpu=False) as player:
+        on_cpu = player.next_pair().before
+    with ComparePlayer(synthetic_clip, doubled_clip, prefer_gpu=True) as player:
+        on_gpu = player.next_pair().before
+
+    assert on_gpu.shape == on_cpu.shape
+    difference = np.abs(on_cpu.astype(int) - on_gpu.astype(int))
+    assert difference.mean() < 2.0, "the two enlargements have diverged"
 
 
 def test_pair_is_frozen(gray_source, gray_output_60):
