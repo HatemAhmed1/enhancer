@@ -4,13 +4,16 @@ Local GPU video and image upscaler, tuned for restoring Indian cinema footage �
 
 Runs entirely offline. No cloud services, no API keys, no telemetry.
 
-**Status:** working end to end — engine, restoration, frame interpolation, resumable rendering, and a desktop window. 323 tests. See [Roadmap](#roadmap) for what remains.
+**Status:** working end to end — engine, restoration, frame interpolation, resumable rendering, and a desktop window with before/after comparison. 813 tests. See [Roadmap](#roadmap) for what remains.
 
 ---
 
 ## Features
 
 - **Desktop window** — drag-and-drop, automatic source analysis, live progress, safe cancel, and a ten-second preview so a bad setting costs a minute rather than a night
+- **Before and after** — put one frame through the current settings in about a second and compare it with the original by swipe, split or in-place toggle, zoomed to 100% or beyond; the original is enlarged to match, so you judge quality rather than size
+- **Playback** — stream a finished result against its source in step, because grain that pulses and skin that slides in and out of focus only show in motion
+- **Light or dark** — follows Windows, overridable, remembered
 - **Frame interpolation** — any target frame rate, including non-integer ratios like 24→60, with cut detection so fast-cut footage never ghosts between shots
 - **Texture-preserving** — degrain, upscale, then restore the source's real high-frequency detail and re-grain, so skin reads as photographed rather than polished
 - **Source-aware restoration** — detects interlacing versus 3:2 telecine and applies the correct correction, since getting that wrong damages every frame irreversibly
@@ -20,7 +23,7 @@ Runs entirely offline. No cloud services, no API keys, no telemetry.
 - **Any model** — drop any [OpenModelDB](https://openmodeldb.info/) `.pth` into `models/custom/` and it appears automatically; architecture is auto-detected
 - **Colour-correct** — BT.601/709 primaries, transfer, matrix, and sample aspect ratio are preserved end to end
 - **10-bit NVENC output** with audio, subtitle, and chapter passthrough
-- **Images and video** — `.png`, `.jpg`, `.webp` stills alongside `.mp4`, `.mkv`, `.mov`, with alpha preserved
+- **Images and video** — `.png`, `.jpg`, `.webp`, `.bmp`, `.tif` stills alongside `.mp4`, `.mkv`, `.mov`, `.avi`, `.webm`, with alpha preserved
 - **YouTube source** — search and download directly, no API key required
 
 ---
@@ -262,16 +265,32 @@ Benchmark your own hardware with the `bench` command before starting a long job.
 
 ```
 src/enhancer/
-  vram.py       tiling, OOM recovery, device probing
-  models.py     model manifest, download, verification, loading
-  video_io.py   ffprobe analysis, ffmpeg decode/encode pipes
-  upscale.py    frame processing with CPU fallback
-  bench.py      throughput and VRAM measurement
-  sources.py    YouTube search and download
-  cli.py        command-line entrypoint
+  vram.py        tiling, OOM recovery, device probing
+  models.py      model manifest, download, verification, loading
+  video_io.py    ffprobe analysis, ffmpeg decode/encode pipes
+  upscale.py     frame processing with CPU fallback
+  restore.py     filter graph, detail retention, re-grain
+  analyze.py     scan type, grain, blockiness
+  timing.py      output frame planning for any frame-rate ratio
+  scenes.py      cut detection
+  interpolate.py RIFE stream driver
+  forecast.py    predicted output, from measured throughput
+  segments.py    atomic segment writing, concat assembly
+  jobs.py        resume journal
+  queue.py       render queue
+  images.py      still-image path
+  compare.py     one frame before and after
+  playback.py    two streams aligned by time
+  viewer.py      swipe, split and toggle comparison widget
+  window.py      desktop window
+  theme.py       palette, light and dark
+  help_text.py   every user-facing explanation
+  bench.py       throughput and VRAM measurement
+  sources.py     YouTube search and download
+  cli.py         command-line entrypoint
 docs/
-  specs/        design specification
-  plans/        implementation plans
+  specs/         design specification
+  plans/         implementation plans
 ```
 
 Run the test suite:
@@ -290,8 +309,9 @@ Run the test suite:
 | Resilience | Resumable renders, physical VRAM ceiling | Complete |
 | Restoration | Deinterlace/IVTC, deblock, degrain, re-grain, detail retention | Complete |
 | Interpolation | RIFE frame interpolation, scene-change detection, target FPS | Complete |
-| Interface | Desktop GUI, segment preview | Complete |
-| Comparison | A/B compare view, batch queue | Planned |
+| Interface | Desktop GUI, segment preview, render queue | Complete |
+| Comparison | Single-frame before/after, synced playback | Complete |
+| Acceleration | TensorRT engine build | Planned |
 
 ---
 
