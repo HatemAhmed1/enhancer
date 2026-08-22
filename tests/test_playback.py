@@ -215,34 +215,11 @@ def test_before_is_the_bicubic_enlargement_of_the_source_frame(
         Image.fromarray(raw).resize((640, 480), Image.BICUBIC), dtype=np.uint8
     )
 
-    with ComparePlayer(synthetic_clip, doubled_clip, prefer_gpu=False) as player:
+    with ComparePlayer(synthetic_clip, doubled_clip) as player:
         pair = player.next_pair()
 
     assert pair.before.shape == (480, 640, 3)
     assert np.array_equal(pair.before, expected)
-
-
-def test_the_card_gives_the_same_enlargement_as_pillow(synthetic_clip, doubled_clip):
-    """The fast path must stay the honest baseline, not merely a fast one.
-
-    Pillow's cubic kernel uses a = -0.5 and torch's a = -0.75, so the two are
-    not bit-identical. Both are plain bicubic, and on real footage the gap is
-    invisible; this pins that it stays a rounding difference rather than
-    drifting into a different filter.
-    """
-    import torch
-
-    if not torch.cuda.is_available():
-        pytest.skip("no CUDA on this machine")
-
-    with ComparePlayer(synthetic_clip, doubled_clip, prefer_gpu=False) as player:
-        on_cpu = player.next_pair().before
-    with ComparePlayer(synthetic_clip, doubled_clip, prefer_gpu=True) as player:
-        on_gpu = player.next_pair().before
-
-    assert on_gpu.shape == on_cpu.shape
-    difference = np.abs(on_cpu.astype(int) - on_gpu.astype(int))
-    assert difference.mean() < 2.0, "the two enlargements have diverged"
 
 
 def test_pair_is_frozen(gray_source, gray_output_60):
@@ -465,3 +442,43 @@ def test_an_empty_video_raises_value_error(gray_source, gray_output_60, monkeypa
     monkeypatch.setattr(playback.SourceProfile, "probe", classmethod(empty))
     with pytest.raises(ValueError, match="no frames"):
         ComparePlayer(gray_source, gray_output_60)
+
+
+def test_playing_at_a_reduced_height_really_decodes_smaller(gray_source, gray_output_60):
+    """The whole point of the proxy: fewer pixels actually cross the pipe.
+
+    A 4K frame is 24.9 MB, so sixty a second is more than a pipe carries and
+    playback stalls near ten frames a second. Decoding at the height the pane
+    shows takes the same clip to seventy-five.
+    """
+    native = SourceProfile.probe(gray_output_60).height
+    wanted = max(2, native // 2)
+
+    with ComparePlayer(gray_source, gray_output_60, decode_height=wanted) as player:
+        pair = player.next_pair()
+        second = player.next_pair()
+
+    assert pair.after.shape[0] == wanted, "decoded at full size despite the request"
+    assert pair.before.shape == pair.after.shape, "the halves must still match"
+    assert second.after.shape == pair.after.shape
+
+
+def test_asking_for_more_than_the_picture_has_changes_nothing(gray_source, gray_output_60):
+    """Enlarging here would present invented rows as though they were real."""
+    native = SourceProfile.probe(gray_output_60).height
+
+    with ComparePlayer(gray_source, gray_output_60, decode_height=native * 4) as player:
+        pair = player.next_pair()
+
+    assert pair.after.shape[0] == native
+
+
+def test_a_proxied_pair_still_holds_the_right_source_frame(gray_source, gray_output_60):
+    """Scaling must not disturb the time alignment it sits on top of."""
+    with ComparePlayer(gray_source, gray_output_60, decode_height=120) as player:
+        player.seek(1.0)
+        pair = player.next_pair()
+        expected = source_index_for(pair.index, player.fps,
+                                    SourceProfile.probe(gray_source).fps)
+
+    assert player.source_index == expected

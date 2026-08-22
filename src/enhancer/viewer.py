@@ -32,8 +32,10 @@ Why QImage and not QPixmap
 This started as a still-image widget, so each frame was converted once into a
 QPixmap and that cost did not matter. Playback pushes a new pair 24-60 times a
 second, and ``QPixmap.fromImage`` is a full-frame copy *and* a 24bpp->32bpp
-widening: measured at 13.0 ms for one 3840x2160 frame on this machine, so 26 ms
-per pair before a single pixel is drawn. That alone capped a 4K swipe at 30 fps.
+widening: 7-8 ms for one 3840x2160 frame on this machine, so 15 ms per pair
+before a single pixel is drawn. That alone capped a 4K swipe at 30 fps.
+(An earlier note here said 13 ms; a re-measurement with proper warm-up put it
+lower. The conclusion is unchanged, but the number was not honest.)
 
 Wrapping the numpy buffer in a ``QImage`` is free — it does not copy — and
 ``QPainter.drawImage`` blits straight from it. The blit itself is dearer than
@@ -236,8 +238,9 @@ class CompareView(QWidget):
         It delegates, and that is the finding rather than an oversight. Once the
         two QPixmap conversions were gone there was nothing left in set_pair
         that a still image could afford and playback could not: pushing a pair
-        costs 0.17 ms at 4K, against 26.8 ms before, and everything else on the
-        path is arithmetic on a handful of floats.
+        costs well under a tenth of a millisecond at 4K, against roughly 27 ms
+        before, and everything else on the path is arithmetic on a handful of
+        floats.
 
         Two further divergences were written, measured and removed: invalidating
         only the picture rect instead of the whole widget (3.8% fewer pixels

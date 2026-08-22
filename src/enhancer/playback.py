@@ -112,15 +112,10 @@ class ComparePlayer:
     which tears both pipes down and starts two new ones.
     """
 
-    def __init__(self, source: Path, output: Path, prefer_gpu: bool = True,
+    def __init__(self, source: Path, output: Path,
                  decode_height: int | None = None) -> None:
         self.source = Path(source)
         self.output = Path(output)
-        # Enlarging the source frame on the card is nine times faster, which is
-        # most of the difference between playback that keeps up and playback
-        # that does not. Turned off while a render owns the card, so watching
-        # one clip cannot quietly slow the job that is producing the next.
-        self.prefer_gpu = prefer_gpu
         # Height to decode at, or None for native. See _proxy().
         self.decode_height = decode_height
 
@@ -302,7 +297,7 @@ class ComparePlayer:
         """
         shape = (after.shape[0], after.shape[1])
         if self._before is None or self._before_shape != shape:
-            scaled = _match_size(self._src_frame, after, self.prefer_gpu)
+            scaled = _match_size(self._src_frame, after)
             if scaled is self._src_frame:
                 # Same size already: _match_size hands the array straight back.
                 # Take a copy so the read-only cache and the held source frame
@@ -318,9 +313,11 @@ class ComparePlayer:
 
         Playback is limited by how many pixels cross the pipe, not by the
         codec: a 4K frame is 24.9 MB, so sixty a second is 1.5 GB/s, and it
-        tops out near 20 fps. Hardware decoding does not help, because the cost
-        is the rgb24 conversion and the transfer rather than the decode itself.
-        Scaling inside ffmpeg first measures 102 fps on the same file.
+        tops out around 20-30 fps depending on the material. Hardware decoding
+        does not help, because the cost is the rgb24 conversion and the
+        transfer rather than the decode itself. Scaling inside ffmpeg first
+        measured 102 fps on one 4K clip and 183 on another; the ratio holds
+        even though the absolute numbers depend on the footage.
 
         Only ever downwards. Asking for more than the picture has would enlarge
         it here and then present it as though it were real detail.

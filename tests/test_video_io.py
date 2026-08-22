@@ -187,12 +187,39 @@ def test_the_pipe_buffer_does_not_scale_with_frame_size():
     assert PIPE_BUFFER_BYTES >= 1 << 16, "a tiny buffer costs a syscall per read"
 
 
-def test_a_resizing_filter_needs_its_output_size_declared():
+def test_a_resizing_filter_needs_its_output_size_declared(tmp_path):
     """Without it the read loop pulls source-sized chunks from a scaled stream.
 
     Every frame after the first is then torn, silently, because the reads and
-    the frame boundaries have drifted apart.
+    the frame boundaries have drifted apart. Asserting the getter alone would
+    not notice: this decodes real frames and checks what comes out.
     """
+    import subprocess
+
+    from enhancer.video_io import Decoder, SourceProfile
+
+    clip = tmp_path / "solid.mkv"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+         "-i", "color=c=red:size=640x480:rate=10:duration=1",
+         "-c:v", "ffv1", str(clip)],
+        check=True, capture_output=True,
+    )
+    profile = SourceProfile.probe(clip)
+
+    frames = list(
+        Decoder(profile, video_filter="scale=320:240", frame_size=(320, 240)).frames()
+    )
+    assert len(frames) >= 5, "the scaled stream produced almost nothing"
+    for frame in frames:
+        assert frame.shape == (240, 320, 3)
+        # A solid red source stays solid unless the reads have slipped out of
+        # step with the frame boundaries, which is exactly the tearing bug.
+        assert frame[..., 0].min() > 200, "frame is torn: reads lost alignment"
+        assert frame[..., 1].max() < 60
+
+
+def test_the_frame_size_defaults_to_the_profile():
     from enhancer.video_io import Decoder, SourceProfile
 
     profile = SourceProfile(
