@@ -649,8 +649,9 @@ def test_a_slow_decode_drops_a_frame_rather_than_queueing_it(window):
 
 def test_reaching_the_end_stops_unless_looping(window):
     window.loop_check.setChecked(False)
+    window.play_worker = object()
     window.play_timer.start(1000)
-    window._on_playback_ended()
+    window._on_playback_ended(window._play_token)
     assert not window.play_timer.isActive()
     assert window.play_button.text() == "Play"
 
@@ -659,8 +660,9 @@ def test_looping_rewinds_instead_of_stopping(window):
     sought = []
     window.request_seek.connect(sought.append)
     window.loop_check.setChecked(True)
+    window.play_worker = object()
     window.play_timer.start(1000)
-    window._on_playback_ended()
+    window._on_playback_ended(window._play_token)
 
     assert sought == [0.0]
     assert window.play_timer.isActive(), "looping stopped playback"
@@ -750,3 +752,91 @@ def test_a_tiny_pane_still_asks_for_a_usable_picture(window):
     """A collapsed pane must not ask ffmpeg for a two-pixel-tall stream."""
     window.view.resize(800, 10)
     assert window._needed_decode_height() >= 240
+
+
+# --- states the audit found ------------------------------------------------
+
+
+def test_a_result_from_an_abandoned_player_is_ignored(window):
+    """Probing a fresh 4K file is slow enough to finish after the user moves on.
+
+    Acting on it enabled Play and filled the seek bar for a player that no
+    longer existed: the timer then ran forever over a blank picture.
+    """
+    window.play_worker = None  # as _stop_playback leaves it
+    window.comparison = None
+
+    window._on_playback_opened(window._play_token, 60.0, 240, 0.0, 4.0)
+
+    assert not window.play_button.isEnabled()
+    assert window.position.maximum() == 0
+
+
+def test_a_finished_render_is_paired_with_its_own_source(window, tmp_path, monkeypatch):
+    """A queue holding two sources otherwise plays one film against another."""
+    from enhancer.queue import Task
+    from enhancer.requests import RenderRequest
+
+    other = tmp_path / "other.mkv"
+    other.write_bytes(b"")
+    result = tmp_path / "done.mkv"
+    result.write_bytes(b"")
+
+    attached = []
+    monkeypatch.setattr(window, "_load_comparison", attached.append)
+    monkeypatch.setattr(window, "_start_next", lambda: None)
+
+    window.source = tmp_path / "currently_open.mkv"
+    window.active_task = Task(request=RenderRequest(
+        model=tmp_path / "m.pth", source=other, output=result,
+    ))
+    window._on_finished(str(result))
+
+    assert attached == [], "attached a render belonging to a different source"
+
+
+def test_play_at_the_end_rewinds_instead_of_stalling(window):
+    """Otherwise the button flickers Pause then Play and nothing moves."""
+    sought = []
+    window.request_seek.connect(sought.append)
+    window._at_end = True
+    window._play_fps = 60.0
+
+    window._toggle_play()
+
+    assert sought == [0.0]
+    assert not window._at_end
+    window._pause()
+
+
+def test_compare_with_is_dead_until_a_source_is_open(window, tmp_path):
+    """It opened a file dialog, took a file, and silently did nothing."""
+    from PIL import Image
+
+    assert not window.compare_with_button.isEnabled()
+    src = tmp_path / "s.png"
+    Image.new("RGB", (16, 16), (7, 7, 7)).save(src)
+    window._load_source(src)
+    assert window.compare_with_button.isEnabled()
+
+
+def test_a_frame_from_a_superseded_player_never_reaches_the_screen(window):
+    """Two attaches in quick succession: the first must not paint over the second."""
+    import numpy as np
+
+    class Pair:
+        before = after = np.zeros((8, 8, 3), dtype=np.uint8)
+        index, seconds = 5, 0.5
+
+    window.play_worker = object()          # something is attached
+    window._play_token = 7
+    window._frame_in_flight = True
+
+    window._on_playback_frame(6, Pair())   # from the previous player
+
+    assert not window.view.has_pair(), "a stale frame was painted"
+    assert window._frame_in_flight, "a stale frame cleared the in-flight guard"
+
+    window._on_playback_frame(7, Pair())   # from the current one
+    assert window.view.has_pair()
+    assert not window._frame_in_flight

@@ -196,18 +196,24 @@ class PlaybackWorker(QObject):
     window would stop responding for the length of the clip.
     """
 
-    opened = Signal(float, int, float, float)  # fps, frames, start, end
-    frame = Signal(object)
-    ended = Signal()
-    failed = Signal(str)
+    # Every signal carries the token of the worker that sent it. Probing a
+    # freshly written 4K file is slow, so a worker abandoned mid-open still
+    # reports back afterwards; without a token the window acted on it and
+    # enabled Play for a player that no longer existed. Checked by token
+    # rather than by QObject.sender() so the guard holds however the handler
+    # is reached, including from a test that calls it directly.
+    opened = Signal(int, float, int, float, float)  # token, fps, frames, start, end
+    frame = Signal(int, object)
+    ended = Signal(int)
+    failed = Signal(int, str)
 
-    def __init__(self, source: Path, output: Path, prefer_gpu: bool = True,
-                 decode_height: int | None = None) -> None:
+    def __init__(self, source: Path, output: Path,
+                 decode_height: int | None = None, token: int = 0) -> None:
         super().__init__()
         self._source = source
         self._output = output
-        self._prefer_gpu = prefer_gpu
         self._decode_height = decode_height
+        self.token = token
         self.player = None
 
     def open(self) -> None:
@@ -215,16 +221,15 @@ class PlaybackWorker(QObject):
             from .playback import ComparePlayer
 
             self.player = ComparePlayer(
-                self._source, self._output, prefer_gpu=self._prefer_gpu,
-                decode_height=self._decode_height,
+                self._source, self._output, decode_height=self._decode_height
             )
             self.player.open()
             start, end = self.player.covers
             self.opened.emit(
-                self.player.fps, self.player.frame_count, start, end
+                self.token, self.player.fps, self.player.frame_count, start, end
             )
         except Exception as exc:  # noqa: BLE001 - surfaced to the user
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            self.failed.emit(self.token, f"{type(exc).__name__}: {exc}")
 
     def deliver_next(self) -> None:
         if self.player is None:
@@ -232,12 +237,12 @@ class PlaybackWorker(QObject):
         try:
             pair = self.player.next_pair()
         except Exception as exc:  # noqa: BLE001 - surfaced to the user
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            self.failed.emit(self.token, f"{type(exc).__name__}: {exc}")
             return
         if pair is None:
-            self.ended.emit()
+            self.ended.emit(self.token)
         else:
-            self.frame.emit(pair)
+            self.frame.emit(self.token, pair)
 
     def seek(self, seconds: float) -> None:
         if self.player is None:
@@ -245,7 +250,7 @@ class PlaybackWorker(QObject):
         try:
             self.player.seek(seconds)
         except Exception as exc:  # noqa: BLE001 - surfaced to the user
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            self.failed.emit(self.token, f"{type(exc).__name__}: {exc}")
             return
         self.deliver_next()
 
@@ -399,6 +404,8 @@ class MainWindow(QMainWindow):
         self._play_fps = 24.0
         self._play_duration = 0.0
         self._frame_in_flight = False
+        self._at_end = False
+        self._play_token = 0
         self._decode_height: int | None = None
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self._tick)
@@ -558,6 +565,9 @@ class MainWindow(QMainWindow):
 
         self.compare_with_button = QPushButton("Compare with...")
         self.compare_with_button.setToolTip(HELP["compare_with"])
+        # _load_comparison needs an original to compare against. Without this
+        # the dialog opened, took a file, and did nothing without saying so.
+        self.compare_with_button.setEnabled(False)
         self.compare_with_button.clicked.connect(self._browse_comparison)
         row.addWidget(self.compare_with_button)
         row.addWidget(help_button("compare_with"))
@@ -1209,6 +1219,7 @@ class MainWindow(QMainWindow):
         # film's render while the window named the new one.
         self._stop_playback()
         self.compare_button.setEnabled(True)
+        self.compare_with_button.setEnabled(True)
         QApplication.processEvents()
 
         if is_image(path):
@@ -1363,18 +1374,20 @@ class MainWindow(QMainWindow):
         """How tall the played picture needs to be: what the pane can show.
 
         Playback is limited by pixels crossing the pipe. A 4K frame is 24.9 MB,
-        so sixty a second is 1.5 GB/s, and it manages about ten — measured, and
-        neither hardware decoding nor a bigger buffer moves it, because the cost
-        is the rgb24 conversion and the transfer rather than the decode. Fitted
-        into a seven-hundred-pixel pane, seven eighths of those rows are thrown
-        away before they are ever seen. Not decoding them takes the same clip
-        from ten frames a second to seventy-five.
+        so sixty a second is 1.5 GB/s and the whole player manages roughly ten
+        to thirteen pairs a second. Neither hardware decoding nor a bigger
+        buffer moves it: the cost is the rgb24 conversion and the transfer
+        rather than the decode. Fitted into a seven-hundred-pixel pane, seven
+        eighths of those rows are discarded before anyone sees them; not
+        decoding them measured 75 and 124 pairs a second on two different 4K
+        clips, and 46 through the window with painting and pacing on top.
 
-        Deliberately not tied to the zoom. A stream decoded small and then
-        magnified would make the zoom readout a lie: "100%" would mean one
-        proxy pixel per screen pixel, not one output pixel. Playback answers
-        whether the motion holds up; Compare this frame answers whether the
-        texture does, at full resolution, and that is the one to zoom into.
+        Deliberately not tied to the zoom. What plays is a proxy, so magnifying
+        it cannot reveal texture that was never decoded, and at 100% the
+        caption reports one proxy pixel per screen pixel while the user would
+        reasonably read it as one output pixel. Playback answers whether the
+        motion holds up; Compare this frame answers whether the texture does,
+        at full resolution, and that is the one to zoom into.
         """
         return max(240, self.view.height())
 
@@ -1393,12 +1406,11 @@ class MainWindow(QMainWindow):
         self._stop_playback()
 
         self.play_thread = QThread(self)
-        # A render owns the card while it runs; the resize would take a share
-        # of it and slow a job with hours left, for a clip being watched now.
         self._decode_height = self._needed_decode_height()
+        self._play_token += 1
         self.play_worker = PlaybackWorker(
-            self.source, path, prefer_gpu=self.thread is None,
-            decode_height=self._decode_height,
+            self.source, path, decode_height=self._decode_height,
+            token=self._play_token,
         )
         self.play_worker.moveToThread(self.play_thread)
         self.play_worker.opened.connect(self._on_playback_opened)
@@ -1413,7 +1425,14 @@ class MainWindow(QMainWindow):
         self.compare_with_button.setText(path.name)
         self.request_open.emit()
 
-    def _on_playback_opened(self, fps: float, frames: int, start: float, end: float) -> None:
+    def _stale(self, token: int) -> bool:
+        """True when this signal came from a worker that has been replaced."""
+        return token != self._play_token or self.play_worker is None
+
+    def _on_playback_opened(self, token: int, fps: float, frames: int,
+                            start: float, end: float) -> None:
+        if self._stale(token) or self.comparison is None:
+            return
         self._play_fps = fps if fps > 0 else 24.0
         self.position.setRange(0, max(0, frames - 1))
         self.position.setEnabled(frames > 0)
@@ -1428,7 +1447,9 @@ class MainWindow(QMainWindow):
         self._frame_in_flight = True
         self.request_frame.emit()
 
-    def _on_playback_frame(self, pair) -> None:
+    def _on_playback_frame(self, token: int, pair) -> None:
+        if self._stale(token):
+            return  # a frame from an abandoned player, over a newer picture
         self._frame_in_flight = False
         self.view.set_frame(pair.before, pair.after)
         if not self.position.isSliderDown():
@@ -1439,14 +1460,19 @@ class MainWindow(QMainWindow):
             f"{_clock(pair.seconds)} / {_clock(self._play_duration)}"
         )
 
-    def _on_playback_ended(self) -> None:
+    def _on_playback_ended(self, token: int) -> None:
+        if self._stale(token):
+            return
+        self._at_end = True
         self._frame_in_flight = False
         if self.loop_check.isChecked() and self.play_timer.isActive():
             self.request_seek.emit(0.0)
             return
         self._pause()
 
-    def _on_playback_failed(self, message: str) -> None:
+    def _on_playback_failed(self, token: int, message: str) -> None:
+        if self._stale(token):
+            return
         self._frame_in_flight = False
         self._pause()
         self._append(f"Playback failed: {message}")
@@ -1456,6 +1482,13 @@ class MainWindow(QMainWindow):
         if self.play_timer.isActive():
             self._pause()
         else:
+            if self._at_end:
+                # Stopped at the last frame. Without this, Play asks for a
+                # frame, is told there are none, and pauses again — the button
+                # flickers and nothing moves.
+                self._at_end = False
+                self._frame_in_flight = True
+                self.request_seek.emit(0.0)
             self.view.set_playing(True)
             self.play_button.setText("Pause")
             self.play_timer.start(max(1, round(1000.0 / self._play_fps)))
@@ -1479,6 +1512,7 @@ class MainWindow(QMainWindow):
 
     def _seek_to_slider(self) -> None:
         if self._play_fps:
+            self._at_end = False
             self._frame_in_flight = True
             self.request_seek.emit(self.position.value() / self._play_fps)
 
@@ -1496,6 +1530,7 @@ class MainWindow(QMainWindow):
         self.play_thread = None
         self.play_worker = None
         self._frame_in_flight = False
+        self._at_end = False
         self.comparison = None
         self.compare_with_button.setText("Compare with...")
         self.play_button.setEnabled(False)
@@ -1512,6 +1547,9 @@ class MainWindow(QMainWindow):
         request = self._build_request(preview=False)
         if request is None:
             return
+        # Playback would keep pushing frames over the result, and both want the
+        # card. Stopping is less surprising than a picture that flickers back.
+        self._pause()
 
         self.compare_button.setEnabled(False)
         self.compare_button.setText("Comparing...")
@@ -1631,16 +1669,25 @@ class MainWindow(QMainWindow):
     def _on_finished(self, path: str) -> None:
         self._append(f"Done: {path}")
         self.status.setText("Finished.")
+        # The source this render actually used, captured before the task is
+        # finished and cleared. Using whatever is loaded now would pair one
+        # film's original with another film's render — which a queue holding
+        # two different sources does every single time.
+        rendered_from = (
+            self.active_task.request.source if self.active_task is not None else None
+        )
         if self.active_task is not None:
             self.queue.finish(self.active_task)
         self._teardown()
 
         # Attach what was just produced, so Play works without hunting for the
-        # file. A still has nothing to play.
+        # file. A still has nothing to play, and a result belonging to a source
+        # the user has since navigated away from is not theirs to attach.
         from .images import is_image
 
         result = Path(path)
-        if self.source is not None and not is_image(result) and result.exists():
+        if (rendered_from is not None and self.source == rendered_from
+                and not is_image(result) and result.exists()):
             self._load_comparison(result)
 
         self._start_next()
