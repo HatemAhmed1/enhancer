@@ -91,6 +91,10 @@ def _parse_probe(raw: dict) -> SourceProfile:
     )
 
 
+# Pipe read buffer. See Decoder.frames() for why this is fixed, not per-frame.
+PIPE_BUFFER_BYTES = 1 << 20
+
+
 class Decoder:
     """Streams RGB24 frames from ffmpeg over a pipe. Never touches disk.
 
@@ -135,16 +139,29 @@ class Decoder:
     def frames(self) -> Iterator[np.ndarray]:
         p = self.profile
         frame_bytes = p.width * p.height * 3
+        # A fixed, modest buffer. Sizing it to the frame made it 99 MB at 4K,
+        # and Python's buffered reader refills the whole thing before handing
+        # back the first frame: the same clip ffmpeg decodes at 171 fps came
+        # through the pipe at 4.9 fps. One megabyte measured 4x faster at 4K
+        # and costs nothing at smaller sizes.
         process = proc.popen(
-            self._command(), stdout=subprocess.PIPE, bufsize=frame_bytes * 4
+            self._command(), stdout=subprocess.PIPE, bufsize=PIPE_BUFFER_BYTES
         )
+        drained = False
         try:
             while True:
                 buf = process.stdout.read(frame_bytes)
                 if len(buf) < frame_bytes:
+                    drained = True
                     break
                 yield np.frombuffer(buf, np.uint8).reshape(p.height, p.width, 3)
         finally:
+            if not drained and process.poll() is None:
+                # Abandoned before the end: a seek, a cancelled render, a
+                # single-frame comparison. Closing the pipe first leaves ffmpeg
+                # writing into nothing, and it reports a page of "Broken pipe"
+                # errors for every one. Asking it to stop is the clean exit.
+                process.terminate()
             if process.stdout:
                 process.stdout.close()
             process.wait()

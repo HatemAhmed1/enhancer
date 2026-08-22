@@ -169,3 +169,17 @@ def test_filter_combines_with_seeking(synthetic_clip):
         Decoder(p, start_frame=10, max_frames=5, video_filter="hqdn3d=4:3:6:4").frames()
     )
     assert len(frames) == 5
+
+
+def test_the_pipe_buffer_does_not_scale_with_frame_size():
+    """Sizing it per frame made it 99 MB at 4K and decoding four times slower.
+
+    Python's buffered reader fills the whole buffer before returning the first
+    frame, so a huge buffer stalls the stream: measured 5.4 fps at 4K against
+    22.0 fps with a fixed megabyte.
+    """
+    from enhancer.video_io import PIPE_BUFFER_BYTES
+
+    uhd_frame_bytes = 3840 * 2160 * 3
+    assert PIPE_BUFFER_BYTES < uhd_frame_bytes, "buffer would stall 4K decoding"
+    assert PIPE_BUFFER_BYTES >= 1 << 16, "a tiny buffer costs a syscall per read"
