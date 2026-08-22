@@ -509,6 +509,30 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_check(args: argparse.Namespace) -> int:
+    """Report whether this machine can run a render, and what is missing."""
+    from .preflight import blocking, check_all, summary
+
+    requirements = check_all(args.dir, args.output)
+    print(summary(requirements))
+
+    stoppers = blocking(requirements)
+    print()
+    if stoppers:
+        names = ", ".join(r.name for r in stoppers)
+        print(f"Cannot render yet: {names}. See the notes above.")
+        return 1
+
+    try:
+        from .system import describe, detect
+
+        print(describe(detect()))
+    except Exception:  # noqa: BLE001 - a summary is a nicety, not a prerequisite
+        pass
+    print("Ready to render.")
+    return 0
+
+
 def cmd_gui(args: argparse.Namespace) -> int:
     try:
         from .window import launch
@@ -662,6 +686,12 @@ def main(argv: list[str] | None = None) -> int:
 
     g = sub.add_parser("gui", help="open the desktop window")
     g.set_defaults(func=cmd_gui)
+
+    c = sub.add_parser("check", help="check this machine can run a render")
+    c.add_argument("--dir", default="models/custom")
+    c.add_argument("--output", default=None,
+                   help="where output would be written, for the disk space check")
+    c.set_defaults(func=cmd_check)
 
     m = sub.add_parser("models", help="list installed and downloadable weights")
     m.add_argument("--dir", default="models/custom")
