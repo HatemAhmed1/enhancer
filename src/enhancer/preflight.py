@@ -202,13 +202,15 @@ def check_interpolation(weights_dir: Path | str | None = None) -> Requirement:
     )
 
 
-def check_all(models_dir: Path | str = "models/custom",
+def check_all(models_dir: Path | str | None = None,
               output_dir: Path | str | None = None) -> list[Requirement]:
     """Every prerequisite, essential ones first."""
+    from .paths import custom_models_dir
+
     return [
         check_ffmpeg(),
         check_ffprobe(),
-        check_models(models_dir),
+        check_models(models_dir if models_dir is not None else custom_models_dir()),
         check_accelerator(),
         check_disk_space(output_dir or Path.home()),
         check_interpolation(),

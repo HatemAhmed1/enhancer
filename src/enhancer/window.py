@@ -54,6 +54,7 @@ from .help_text import (
 )
 from .jobs import SettingsMismatch
 from .models import scan_custom_dir
+from .paths import custom_models_dir, ensure_models_dirs
 from .queue import RenderQueue, Task, TaskState
 from .requests import RenderRequest
 from .video_io import Decoder, SourceProfile
@@ -67,6 +68,11 @@ VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".ts", ".wmv"
 MEDIA_SUFFIXES = VIDEO_SUFFIXES | IMAGE_SUFFIXES
 
 PREVIEW_SECONDS = 10
+
+# Interpolating past this is a mistake rather than a choice: 100000 fps on a
+# two-second clip builds a plan of two hundred thousand frames and grinds for
+# hours before anyone notices.
+MAX_TARGET_FPS = 480.0
 
 # A cap deliberately set above any consumer card, so the graphics driver spills
 # into system memory instead of the tile planner shrinking to fit. That is the
@@ -447,6 +453,9 @@ class MainWindow(QMainWindow):
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self._tick)
         self.theme_mode = theme.load_mode()
+        # A fresh copy of the packaged build ships no models folder, so there
+        # is nowhere for a download to land and nothing to drop a file into.
+        ensure_models_dirs()
 
         # Detected once, before anything is built: the memory ladder, the
         # encoder and the speed estimates all depend on what this machine
@@ -984,7 +993,7 @@ class MainWindow(QMainWindow):
         output = self.output_label.text() if hasattr(self, "output_label") else ""
         palette = theme.resolve(QApplication.instance(), self.theme_mode)
         rows = []
-        for r in check_all("models/custom", output if not output.startswith("(") else None):
+        for r in check_all(custom_models_dir(), output if not output.startswith("(") else None):
             if r.ok:
                 mark, colour = "Ready", palette.success
             elif r.essential:
@@ -1050,7 +1059,7 @@ class MainWindow(QMainWindow):
         from .preflight import blocking, check_all
 
         try:
-            stoppers = blocking(check_all("models/custom"))
+            stoppers = blocking(check_all(custom_models_dir()))
         except Exception:  # noqa: BLE001 - a check that crashes helps nobody
             return
         if not stoppers:
@@ -1122,6 +1131,16 @@ class MainWindow(QMainWindow):
         for widget in (self.no_restore, self.cpu):
             widget.toggled.connect(self._update_forecast)
 
+    def _running_on_cpu(self) -> bool:
+        """Whether the render will actually use the processor.
+
+        Not the checkbox alone. Someone who ran `pip install torch` has the
+        processor-only build, and was being shown an estimate derived from a
+        graphics card they do not have — a seventeen-hour figure for what
+        would really take weeks.
+        """
+        return self.cpu.isChecked() or self.hardware.accelerator == "cpu"
+
     def _update_forecast(self) -> None:
         from .forecast import forecast
         from .images import is_image
@@ -1165,7 +1184,7 @@ class MainWindow(QMainWindow):
             detail_retention=0.0 if off else self.detail.value() / 100,
             regrain=0.0 if off else self.regrain.value() / 100,
             target_fps=target,
-            cpu=self.cpu.isChecked(),
+            cpu=self._running_on_cpu(),
             is_image=still,
         )
 
@@ -1305,7 +1324,7 @@ class MainWindow(QMainWindow):
 
     def _reload_models(self) -> None:
         self.model_combo.clear()
-        found = scan_custom_dir(Path("models/custom"))
+        found = scan_custom_dir(custom_models_dir())
         if not found:
             self.model_combo.addItem("No models in models/custom", None)
             self.model_combo.setItemData(
@@ -1470,7 +1489,26 @@ class MainWindow(QMainWindow):
         if self.profile is not None:
             mode = self.fps_mode.currentText()
             if mode == "Target FPS":
-                target = float(self.fps_target.currentText())
+                # The box is editable, so this is whatever was typed. Parsed
+                # outside the try below, a stray "60 fps" raised straight out
+                # of the Render slot — and a packaged build has no console, so
+                # the button simply appeared to do nothing.
+                try:
+                    target = float(self.fps_target.currentText().strip())
+                except ValueError:
+                    QMessageBox.warning(
+                        self, "Frame rate",
+                        f"{self.fps_target.currentText()!r} is not a frame rate.\n\n"
+                        "Enter a number, such as 60.",
+                    )
+                    return None
+                if not 1.0 <= target <= MAX_TARGET_FPS:
+                    QMessageBox.warning(
+                        self, "Frame rate",
+                        f"{target:g} fps is outside what this can produce.\n\n"
+                        f"Choose between 1 and {MAX_TARGET_FPS:g}.",
+                    )
+                    return None
             elif mode == "Multiplier":
                 target = self.profile.fps * self.fps_multiplier.value()
             if preview:
@@ -1775,8 +1813,19 @@ class MainWindow(QMainWindow):
         able to act on it without hunting for a folder to delete.
         """
         request = self.worker.request if self.worker else None
+        # Release the queue slot before anything else. _teardown only stops the
+        # thread; leaving the task marked running meant queue.running never
+        # cleared, so every later Render queued behind a job with nothing
+        # behind it, the phantom row could not be removed, and only restarting
+        # the application recovered.
+        task = self.active_task
+        if task is not None:
+            self.queue.stop(task, "Settings changed")
+        self.active_task = None
         self._teardown()
+        self._refresh_queue()
         if request is None:
+            self._start_next()
             return
 
         choice = QMessageBox.question(
@@ -1794,6 +1843,7 @@ class MainWindow(QMainWindow):
         if choice != QMessageBox.Yes:
             self.status.setText("Stopped — settings differ from the unfinished render.")
             self._append("Restore the previous settings to continue it instead.")
+            self._start_next()
             return
 
         import shutil

@@ -884,3 +884,112 @@ def test_the_system_dialog_reports_every_requirement(window):
     html = window._requirements_html()
     for name in ("ffmpeg", "Models", "Disk space"):
         assert name in html
+
+
+# --- what the safety review demonstrated ------------------------------------
+
+
+def test_a_settings_mismatch_releases_the_queue(window, tmp_path, monkeypatch):
+    """It used to jam the queue permanently, recoverable only by restarting.
+
+    _teardown stopped the thread but left the task marked running, so
+    queue.running never cleared. Every later Render queued behind a job with
+    nothing behind it, and the phantom row could not be removed.
+    """
+    from PySide6.QtWidgets import QMessageBox
+
+    from enhancer.queue import Task
+    from enhancer.requests import RenderRequest
+
+    request = RenderRequest(
+        model=tmp_path / "m.pth", source=tmp_path / "s.mkv",
+        output=tmp_path / "o.mkv",
+    )
+    task = window.queue.add(request)
+    window.queue.start(task)
+    window.active_task = task
+    window.worker = None
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.No)
+
+    window._on_settings_changed()
+
+    assert window.queue.running is None, "the queue is still jammed"
+    assert window.active_task is None
+    assert task.can_remove, "the stalled row cannot be cleared"
+
+
+def test_a_typed_frame_rate_that_is_not_a_number_is_refused(window, synthetic_clip,
+                                                            tmp_path, monkeypatch):
+    """The parse sat outside the try, so Render raised out of the slot.
+
+    A packaged build has no console, so the button simply did nothing.
+    """
+    from PySide6.QtWidgets import QMessageBox
+
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a))
+    window._load_source(synthetic_clip)
+    window.model_combo.clear()
+    window.model_combo.addItem("m.pth", str(tmp_path / "m.pth"))
+    window.output_label.setText(str(tmp_path / "out.mkv"))
+    window.fps_mode.setCurrentText("Target FPS")
+    window.fps_target.setCurrentText("60 fps")
+
+    assert window._build_request(preview=False) is None
+    assert warned, "refused it silently"
+
+
+def test_an_absurd_frame_rate_is_refused(window, synthetic_clip, tmp_path, monkeypatch):
+    """100000 fps on a two-second clip grinds for hours before anyone notices."""
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: None)
+    window._load_source(synthetic_clip)
+    window.model_combo.clear()
+    window.model_combo.addItem("m.pth", str(tmp_path / "m.pth"))
+    window.output_label.setText(str(tmp_path / "out.mkv"))
+    window.fps_mode.setCurrentText("Target FPS")
+    window.fps_target.setCurrentText("100000")
+
+    assert window._build_request(preview=False) is None
+
+
+def test_a_processor_only_install_is_forecast_as_one(window, monkeypatch):
+    """`pip install torch` gets the processor-only wheel by default.
+
+    Those users were shown an estimate derived from a graphics card they do
+    not have: seventeen hours for something that would really take weeks.
+    """
+    import dataclasses
+
+    window.cpu.setChecked(False)
+    monkeypatch.setattr(
+        window, "hardware", dataclasses.replace(window.hardware, accelerator="cpu")
+    )
+    assert window._running_on_cpu()
+
+    monkeypatch.setattr(
+        window, "hardware", dataclasses.replace(window.hardware, accelerator="cuda")
+    )
+    assert not window._running_on_cpu()
+    window.cpu.setChecked(True)
+    assert window._running_on_cpu(), "the checkbox must still be honoured"
+
+
+def test_models_are_found_beside_the_application_not_the_shell(tmp_path, monkeypatch):
+    """Run the packaged build from anywhere else and it reported no models."""
+    from enhancer import paths
+
+    monkeypatch.chdir(tmp_path)
+    assert paths.custom_models_dir().is_absolute()
+    assert "models" in str(paths.custom_models_dir())
+    assert paths.app_dir() != tmp_path
+
+
+def test_a_models_folder_in_the_working_directory_still_wins(tmp_path, monkeypatch):
+    """So a project can keep its own models beside it."""
+    from enhancer import paths
+
+    (tmp_path / "models" / "custom").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    assert paths.custom_models_dir() == tmp_path / "models" / "custom"
