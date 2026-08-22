@@ -681,11 +681,26 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+def _models_dir(given: str | None) -> Path:
+    """The models folder, defaulting to the one beside the application.
+
+    A literal "models/custom" is relative to whatever directory the user
+    happened to be in, so the packaged build reported no models installed
+    unless it was launched from its own folder, and a download landed
+    wherever the shell was.
+    """
+    if given:
+        return Path(given)
+    from .paths import ensure_models_dirs
+
+    return ensure_models_dirs()
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """Report whether this machine can run a render, and what is missing."""
     from .preflight import blocking, check_all, summary
 
-    requirements = check_all(args.dir, args.output)
+    requirements = check_all(_models_dir(args.dir), args.output)
     print(summary(requirements))
 
     stoppers = blocking(requirements)
@@ -724,7 +739,7 @@ def _registry(cache_dir: Path) -> "ModelRegistry":
 
 def cmd_models(args: argparse.Namespace) -> int:
     """List drop-in weights and the curated, hash-verified catalogue."""
-    cache = Path(args.dir)
+    cache = _models_dir(args.dir)
 
     if args.get:
         reg = _registry(cache)
@@ -863,13 +878,15 @@ def main(argv: list[str] | None = None) -> int:
     g.set_defaults(func=cmd_gui)
 
     c = sub.add_parser("check", help="check this machine can run a render")
-    c.add_argument("--dir", default="models/custom")
+    c.add_argument("--dir", default=None,
+                   help="models folder (default: beside the application)")
     c.add_argument("--output", default=None,
                    help="where output would be written, for the disk space check")
     c.set_defaults(func=cmd_check)
 
     m = sub.add_parser("models", help="list installed and downloadable weights")
-    m.add_argument("--dir", default="models/custom")
+    m.add_argument("--dir", default=None,
+                   help="models folder (default: beside the application)")
     m.add_argument("--get", default=None, metavar="ID",
                     help="download a catalogue model and verify its SHA-256")
     m.set_defaults(func=cmd_models)

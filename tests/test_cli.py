@@ -442,3 +442,25 @@ def test_image_run_refuses_an_output_that_is_the_source(tmp_path, capsys):
     code = cli.main(["video", "m.pth", str(src), str(src)])
     assert code == 4
     assert "same file as the source" in capsys.readouterr().out
+
+
+def test_the_models_folder_is_found_from_any_directory(tmp_path, monkeypatch, capsys):
+    """The packaged build reported no models unless launched from its own folder.
+
+    `--dir` defaulted to the literal "models/custom", which is relative to
+    whatever directory the shell happened to be in, so `models --get` also
+    downloaded into that directory rather than beside the application.
+    """
+    from enhancer.cli import _models_dir
+
+    monkeypatch.chdir(tmp_path)
+    resolved = _models_dir(None)
+
+    assert resolved.is_absolute()
+    assert resolved != tmp_path / "models" / "custom"
+
+
+def test_an_explicit_models_folder_still_wins(tmp_path):
+    from enhancer.cli import _models_dir
+
+    assert _models_dir(str(tmp_path / "elsewhere")) == tmp_path / "elsewhere"
