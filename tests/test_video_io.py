@@ -1,9 +1,36 @@
+import logging
+import subprocess
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from enhancer import system
 from enhancer.video_io import Decoder, Encoder, SourceProfile, _parse_probe, _parse_fraction
+
+
+def ffprobe_stream(path):
+    """codec_name / pix_fmt / profile straight from the file, not from our args."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=codec_name,pix_fmt,profile,width,height", "-of", "default=nw=1", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    return dict(
+        line.split("=", 1) for line in out.stdout.splitlines() if "=" in line
+    )
+
+
+def encode_clip(dest, clip, **kwargs):
+    """Push a real decoded clip through Encoder and return the finished path."""
+    profile = SourceProfile.probe(clip)
+    with Encoder(
+        dest, width=profile.width, height=profile.height, fps=profile.fps,
+        source=profile, **kwargs,
+    ) as enc:
+        for frame in Decoder(profile).frames():
+            enc.write(frame)
+    return dest
 
 
 def test_parse_fraction_handles_rationals():
@@ -230,3 +257,112 @@ def test_the_frame_size_defaults_to_the_profile():
     assert Decoder(profile).output_size == (3840, 2160)
     scaled = Decoder(profile, video_filter="scale=-2:720", frame_size=(1280, 720))
     assert scaled.output_size == (1280, 720)
+
+
+# --------------------------------------------------------------------------
+# Encoder selection: this used to be hardcoded to hevc_nvenc with no fallback,
+# so every render died at the encode step on any machine without an NVIDIA GPU.
+# --------------------------------------------------------------------------
+
+
+def _profile(tmp_path):
+    return SourceProfile(
+        path=tmp_path / "x.mp4", width=320, height=240, fps=25.0, frame_count=10,
+        pix_fmt="yuv420p", sar="1:1", interlaced=False, field_order="progressive",
+        color_primaries="bt709", color_transfer="bt709", color_space="bt709",
+        duration=1.0,
+    )
+
+
+def test_the_default_codec_is_not_hardcoded(tmp_path):
+    """It must come from system.py, so an AMD or Intel or CPU-only box works."""
+    enc = Encoder(tmp_path / "o.mkv", 320, 240, 25.0, _profile(tmp_path))
+    assert enc.codec == system.default_encoder()
+
+
+def test_an_explicit_codec_still_wins(tmp_path, monkeypatch):
+    def explode():
+        raise AssertionError("an explicit codec must not trigger a probe")
+
+    monkeypatch.setattr(system, "default_encoder", explode)
+    enc = Encoder(tmp_path / "o.mkv", 320, 240, 25.0, _profile(tmp_path), codec="libx265")
+    assert enc.codec == "libx265"
+
+
+@pytest.mark.parametrize(
+    "codec, flag",
+    [("libx265", "-crf"), ("libx264", "-crf"), ("hevc_nvenc", "-cq"),
+     ("hevc_qsv", "-global_quality")],
+)
+def test_the_quality_flag_follows_the_codec(tmp_path, codec, flag):
+    """-cq is NVENC's alone. libx265 ignores it silently and encodes at its
+    own default, so the wrong flag costs quality without any error at all.
+    """
+    cmd = Encoder(
+        tmp_path / "o.mkv", 320, 240, 25.0, _profile(tmp_path), codec=codec, quality=18
+    )._build_command()
+    assert flag in cmd
+    assert cmd[cmd.index(flag) + 1] == "18"
+    assert "-cq" not in cmd or codec.endswith("_nvenc")
+
+
+def test_libx265_writes_a_real_ten_bit_hevc_file(tmp_path, synthetic_clip):
+    """The guaranteed floor, exercised for real rather than argument-checked."""
+    out = encode_clip(tmp_path / "x265.mkv", synthetic_clip, codec="libx265", bit_depth=10)
+    info = ffprobe_stream(out)
+    assert info["codec_name"] == "hevc"
+    assert info["pix_fmt"] == "yuv420p10le"
+    assert info["profile"] == "Main 10"
+    assert out.stat().st_size > 1000
+
+
+def test_the_detected_encoder_writes_a_real_file(tmp_path, synthetic_clip):
+    """Whatever system.py picked here has to survive an actual encode."""
+    codec = system.default_encoder()
+    out = encode_clip(tmp_path / "auto.mkv", synthetic_clip, codec=codec, bit_depth=10)
+    info = ffprobe_stream(out)
+    assert info["codec_name"] in {"hevc", "h264"}
+    assert int(info["width"]) == 320 and int(info["height"]) == 240
+    assert out.stat().st_size > 1000
+    assert len(list(Decoder(SourceProfile.probe(out)).frames())) == 50
+
+
+def test_quality_actually_reaches_the_encoder(tmp_path, synthetic_clip):
+    """The regression that argument assertions cannot catch.
+
+    A quality flag the encoder does not recognise is not an error: ffmpeg warns
+    "has not been used for any stream", exits 0, and encodes at its default. The
+    only proof the flag landed is that the output size responds to it.
+    """
+    good = encode_clip(tmp_path / "q10.mkv", synthetic_clip, codec="libx265", quality=10)
+    poor = encode_clip(tmp_path / "q40.mkv", synthetic_clip, codec="libx265", quality=40)
+    assert good.stat().st_size > poor.stat().st_size * 1.5
+
+
+def test_an_eight_bit_only_encoder_falls_back_instead_of_failing(
+    tmp_path, synthetic_clip, caplog
+):
+    """libx264 is treated as 8-bit only; asking for 10 must degrade, not die."""
+    with caplog.at_level(logging.WARNING, logger="enhancer.video_io"):
+        out = encode_clip(
+            tmp_path / "x264.mkv", synthetic_clip, codec="libx264", bit_depth=10
+        )
+    info = ffprobe_stream(out)
+    assert info["pix_fmt"] == "yuv420p"
+    assert info["codec_name"] == "h264"
+    assert "10-bit" in caplog.text and "libx264" in caplog.text
+
+
+def test_eight_bit_is_honoured_when_asked_for(tmp_path, synthetic_clip):
+    out = encode_clip(tmp_path / "eight.mkv", synthetic_clip, codec="libx265", bit_depth=8)
+    assert ffprobe_stream(out)["pix_fmt"] == "yuv420p"
+
+
+def test_colour_metadata_still_rides_along(tmp_path):
+    """Unchanged behaviour; guarded here because the command builder moved."""
+    cmd = Encoder(
+        tmp_path / "o.mkv", 320, 240, 25.0, _profile(tmp_path), codec="libx265"
+    )._build_command()
+    assert cmd[cmd.index("-color_primaries") + 1] == "bt709"
+    assert cmd[cmd.index("-color_trc") + 1] == "bt709"
+    assert cmd[cmd.index("-colorspace") + 1] == "bt709"

@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 
-from . import proc
+from . import proc, system
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 INTERLACED_FIELD_ORDERS = {"tt", "bb", "tb", "bt"}
 
@@ -189,11 +192,15 @@ class Encoder:
         height: int,
         fps: float,
         source: SourceProfile,
-        codec: str = "hevc_nvenc",
+        codec: str | None = None,
         quality: int = 20,
         bit_depth: int = 10,
         mux_audio: bool = True,
     ) -> None:
+        # `None` means "whatever works on this machine". Hardcoding hevc_nvenc
+        # here made every render fail at the encode step on any machine without
+        # an NVIDIA GPU. An explicit codec still wins.
+        codec = codec or system.default_encoder()
         self.path = Path(path)
         self.width = width
         self.height = height
@@ -205,9 +212,22 @@ class Encoder:
         self.mux_audio = mux_audio
         self._proc: subprocess.Popen | None = None
 
+    @property
+    def effective_bit_depth(self) -> int:
+        """10 only if the chosen encoder can really deliver it."""
+        if self.bit_depth >= 10 and not system.supports_10bit(self.codec):
+            return 8
+        return self.bit_depth
+
     def _build_command(self) -> list[str]:
         s = self.source
-        pix_fmt = "p010le" if self.bit_depth == 10 else "yuv420p"
+        depth = self.effective_bit_depth
+        if depth != self.bit_depth:
+            log.warning(
+                "%s cannot encode %d-bit; writing %d-bit instead",
+                self.codec, self.bit_depth, depth,
+            )
+        pix_fmt = system.pixel_format(self.codec, depth)
         cmd = [
             "ffmpeg", "-v", "error", "-y", "-nostdin",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -226,8 +246,12 @@ class Encoder:
             ]
         else:
             cmd += ["-map", "0:v:0"]
+        # The quality flag is per-encoder. `-cq` is NVENC's; libx265 ignores it
+        # silently (ffmpeg warns and exits 0) and encodes at its own default,
+        # so the wrong flag here costs quality without ever reporting an error.
         cmd += [
-            "-c:v", self.codec, "-cq", str(self.quality),
+            "-c:v", self.codec,
+            *system.quality_args(self.codec, self.quality),
             "-pix_fmt", pix_fmt,
         ]
         # Carry color metadata through explicitly.

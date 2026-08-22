@@ -26,7 +26,7 @@ def write_segment(
     height: int,
     fps: float,
     source: SourceProfile,
-    codec: str = "hevc_nvenc",
+    codec: str | None = None,
     quality: int = 20,
     bit_depth: int = 10,
 ) -> int:
@@ -35,6 +35,8 @@ def write_segment(
     Writes to a .part file and renames only on success, so an interrupted
     segment never leaves behind a file that looks complete. Returns the number
     of frames written.
+
+    `codec=None` lets `Encoder` pick whatever encoder works on this machine.
 
     Audio and subtitles are deliberately not muxed here: `Encoder` normally
     attaches the source's audio/subtitle streams, but doing that per segment
