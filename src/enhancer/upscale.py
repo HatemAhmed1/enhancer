@@ -134,11 +134,28 @@ class Upscaler:
         return to_frame(out)
 
     def _process_on_cpu(self, frame: np.ndarray) -> torch.Tensor:
-        """Last-resort path. Slow, but per-frame and it never crashes."""
-        self.model.to("cpu")
+        """Last-resort path. Slow, but per-frame and it never crashes.
+
+        The processor borrows the model for exactly one frame and gives it
+        back. cpu_fallback_count counts frames, not a mode switch: a frame that
+        will not fit even at the minimum tile is usually a spike (another
+        application taking the card, one unusually large frame), so demoting
+        the whole render to a path that is orders of magnitude slower would
+        turn a hiccup into a ruined overnight job. The weights are a few tens
+        of megabytes; moving them twice costs milliseconds against a whole-
+        frame CPU convolution that costs seconds.
+
+        The cast matters as much as the move. With half=True the weights are
+        float16 while to_tensor() produces float32, and CPU float16 is a
+        compatibility shim rather than a real kernel — so the fallback runs in
+        float32 on the processor whatever the accelerator pass uses, and the
+        original dtype is restored on the way back.
+        """
+        original_dtype = getattr(self.model, "dtype", None)
+        self.model.to("cpu", torch.float32)
         try:
-            img = to_tensor(frame)
+            img = to_tensor(frame).to(memory_format=torch.channels_last)
             with torch.inference_mode():
                 return self.model(img).float()
         finally:
-            self.model.to(self.device)
+            self.model.to(self.device, original_dtype)

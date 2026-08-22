@@ -203,3 +203,73 @@ def test_loaded_model_upscales_by_declared_scale():
 def test_load_model_rejects_missing_file(tmp_path):
     with pytest.raises(FileNotFoundError):
         load_model(tmp_path / "nope.pth", device="cpu", half=False)
+
+
+# ---------------------------------------------------------------------------
+# The surface the per-frame CPU fallback depends on.
+#
+# LoadedModel shipped without a to() method for a long time, while
+# upscale.Upscaler._process_on_cpu called model.to("cpu"). Nothing caught it,
+# because the only test double had a to() of its own. These tests pin the
+# contract on the real class, where a double cannot stand in for it.
+# ---------------------------------------------------------------------------
+
+
+def test_loaded_model_exposes_what_the_cpu_fallback_calls():
+    import inspect
+
+    assert callable(LoadedModel.to)
+    params = inspect.signature(LoadedModel.to).parameters
+    assert "device" in params, "the fallback moves the model to the processor"
+    assert "dtype" in params, "and must cast it, since CPU float16 is a shim"
+    # Both are read back off the parameters, so they cannot go stale after a
+    # move; a plain attribute set once in __init__ could.
+    assert isinstance(LoadedModel.device, property)
+    assert isinstance(LoadedModel.dtype, property)
+
+
+@pytest.mark.weights
+def test_to_round_trips_device_and_dtype_and_stays_honest():
+    """A real model, moved and cast exactly as the CPU fallback moves it."""
+    candidates = list(WEIGHTS_DIR.glob("*.pth"))
+    if not candidates:
+        pytest.skip("no weights downloaded; run the model manager first")
+    m = load_model(candidates[0], device="cpu", half=False)
+    scale, arch, half_support = m.scale, m.arch, m.supports_half
+    assert m.device.type == "cpu"
+    assert m.dtype == torch.float32
+
+    if half_support:
+        m.to(dtype=torch.float16)
+        assert m.dtype == torch.float16, "dtype must report the weights, not a flag"
+        m.to("cpu", torch.float32)
+        assert m.dtype == torch.float32
+
+    # The architecture's own facts survive being moved about.
+    assert (m.scale, m.arch, m.supports_half) == (scale, arch, half_support)
+    assert m(torch.rand(1, 3, 16, 16)).shape[-2:] == (16 * scale, 16 * scale)
+
+
+@pytest.mark.gpu
+@pytest.mark.weights
+def test_a_half_model_survives_a_trip_to_the_processor_and_back():
+    """fp16 -> cpu/fp32 -> cuda/fp16 is the fallback's whole life cycle, and
+    the cast back is lossless because every float16 value is exact in float32."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires a CUDA device")
+    candidates = list(WEIGHTS_DIR.glob("*.pth"))
+    if not candidates:
+        pytest.skip("no weights downloaded; run the model manager first")
+    m = load_model(candidates[0], device="cuda", half=True)
+    if m.dtype != torch.float16:
+        pytest.skip(f"{m.arch} does not support half precision")
+    before = next(m._d.model.parameters()).detach().clone()
+
+    m.to("cpu", torch.float32)
+    assert m.device.type == "cpu" and m.dtype == torch.float32
+    out = m(torch.rand(1, 3, 16, 16))  # must not raise a dtype mismatch
+    assert out.shape[-2:] == (16 * m.scale, 16 * m.scale)
+
+    m.to("cuda", torch.float16)
+    assert m.device.type == "cuda" and m.dtype == torch.float16
+    assert torch.equal(next(m._d.model.parameters()), before)

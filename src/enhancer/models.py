@@ -148,14 +148,28 @@ class LoadedModel:
 
     def __init__(self, descriptor: ImageModelDescriptor, device: torch.device) -> None:
         self._d = descriptor
-        self.device = device
         self.scale = int(descriptor.scale)
         self.arch = descriptor.architecture.name
         self.supports_half = bool(descriptor.supports_half)
+        # `device` is accepted for the caller's convenience and applied here so
+        # that constructing a LoadedModel is enough; it is not remembered,
+        # because the .device property reads the parameters themselves.
+        descriptor.to(torch.device(device))
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         with torch.inference_mode():
             return self._d(x)
+
+    @property
+    def device(self) -> torch.device:
+        """Where the weights actually are, read from the parameters.
+
+        A property rather than a remembered constructor argument, so that it
+        cannot drift out of step with reality after a to() call — the CPU
+        fallback in upscale.py moves this model and must be able to trust what
+        it reads back.
+        """
+        return next(self._d.model.parameters()).device
 
     @property
     def dtype(self) -> torch.dtype:
@@ -167,6 +181,34 @@ class LoadedModel:
         when spandrel reports the architecture actually supports it).
         """
         return next(self._d.model.parameters()).dtype
+
+    def to(
+        self,
+        device: str | torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> "LoadedModel":
+        """Move and/or cast the weights in place, returning self.
+
+        The per-frame CPU fallback needs both halves of this: the processor has
+        no real float16 kernels, so a frame that drops off the accelerator has
+        to be run in float32 there and then cast back.
+
+        `scale`, `arch` and `supports_half` are properties of the architecture
+        and are unaffected; `device` and `dtype` are read from the parameters,
+        so they report the new state without any bookkeeping here. Casting goes
+        through descriptor.model rather than descriptor.to() deliberately:
+        load_model() already decided whether half is allowed, and spandrel's
+        own to() would refuse to cast *back* to a dtype it had let us start in.
+        """
+        if device is not None:
+            self._d.to(torch.device(device))
+        if dtype is not None:
+            self._d.model.to(dtype=dtype)
+        if device is not None or dtype is not None:
+            # The layout is chosen once in load_model(); a cast can drop it, so
+            # restate it and a returning model is exactly as it left.
+            self._d.model.to(memory_format=torch.channels_last)
+        return self
 
 
 def load_model(path: Path, device: str | torch.device = "cuda", half: bool = True) -> LoadedModel:
