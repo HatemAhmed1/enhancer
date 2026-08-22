@@ -169,6 +169,11 @@ HELP: dict[str, str] = {
         "as a guide; once a render starts, the live speed readout is real."
     ),
     "guide_button": "Open a page explaining every setting.",
+    "system_button": (
+        "What this machine is, and whether anything is missing.\n\n"
+        "Lists the graphics card, the video encoder chosen for it, and every "
+        "prerequisite, with the command that installs anything absent."
+    ),
     "compare_button": (
         "Run one frame through the current settings and show it against the "
         "original.\n\n"
@@ -324,6 +329,7 @@ GUIDE_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
         ("What you will get", "forecast"),
         ("Guide", "guide_button"),
         ("Light or dark", "theme_toggle"),
+        ("System", "system_button"),
     ]),
 ]
 

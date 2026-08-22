@@ -360,8 +360,12 @@ def test_automatic_memory_cap_means_no_budget(window):
 
 
 def test_explicit_memory_cap_converts_to_bytes(window):
+    """The ladder is built from the detected card, so read what it offers."""
     window.vram_budget.setCurrentIndex(1)
-    assert window._selected_vram_budget() == 2048 * 1024 ** 2
+    megabytes = window.vram_budget.currentData()
+
+    assert megabytes is not None, "the second entry should be a real cap"
+    assert window._selected_vram_budget() == megabytes * 1024 ** 2
 
 
 def test_memory_cap_reaches_the_request(window, synthetic_clip, tmp_path):
@@ -370,7 +374,8 @@ def test_memory_cap_reaches_the_request(window, synthetic_clip, tmp_path):
     window.model_combo.addItem("m.pth", str(tmp_path / "m.pth"))
     window.output_label.setText(str(tmp_path / "out.mkv"))
     window.vram_budget.setCurrentIndex(1)
-    assert window._build_request(preview=False).vram_budget == 2048 * 1024 ** 2
+    megabytes = window.vram_budget.currentData()
+    assert window._build_request(preview=False).vram_budget == megabytes * 1024 ** 2
 
 
 def test_every_memory_option_is_explained(window):
@@ -840,3 +845,42 @@ def test_a_frame_from_a_superseded_player_never_reaches_the_screen(window):
     window._on_playback_frame(7, Pair())   # from the current one
     assert window.view.has_pair()
     assert not window._frame_in_flight
+
+
+# --- built for the machine it is running on ---------------------------------
+
+
+def test_the_memory_ladder_is_built_from_the_detected_card():
+    """A fixed 2/3/4/5 GB ladder described exactly one card.
+
+    On a 24 GB desktop card every option capped far below what was there; on a
+    4 GB laptop card every option but the first asked for more than existed.
+    """
+    from enhancer.window import vram_choices
+
+    big = [mb for _label, mb in vram_choices(24 * 1024 ** 3, 64 * 1024 ** 3)]
+    small = [mb for _label, mb in vram_choices(4 * 1024 ** 3, 16 * 1024 ** 3)]
+
+    assert big[0] is None and small[0] is None, "Automatic must stay first"
+    assert max(m for m in big[1:-1]) == 24 * 1024
+    assert max(m for m in small[1:-1]) == 4 * 1024
+    assert all(m <= 4 * 1024 for m in small[1:-1]), "offered more than the card has"
+
+
+def test_a_machine_with_no_card_is_not_offered_a_ladder():
+    from enhancer.window import vram_choices
+
+    labels = [label for label, _mb in vram_choices(0, 16 * 1024 ** 3)]
+    assert labels[0] == "Automatic"
+    assert len(labels) == 2, "nothing to divide up without a card"
+
+
+def test_the_window_knows_what_it_is_running_on(window):
+    assert window.hardware.accelerator in ("cuda", "mps", "xpu", "cpu")
+    assert window.hardware.cpu_cores >= 0
+
+
+def test_the_system_dialog_reports_every_requirement(window):
+    html = window._requirements_html()
+    for name in ("ffmpeg", "Models", "Disk space"):
+        assert name in html

@@ -74,15 +74,51 @@ PREVIEW_SECONDS = 10
 # slower, so it is never automatic.
 SYSTEM_MEMORY_MB = 32768
 
-# Graphics-memory caps offered in the Output panel, in megabytes.
-VRAM_CHOICES = [
-    ("Automatic", None),
-    ("2 GB — leave the machine free", 2048),
-    ("3 GB", 3072),
-    ("4 GB", 4096),
-    ("5 GB — maximum speed", 5120),
-    ("Use system memory — for oversized models (slow)", SYSTEM_MEMORY_MB),
-]
+
+def vram_choices(vram_bytes: int = 0, ram_bytes: int = 0) -> list[tuple[str, int | None]]:
+    """Graphics-memory caps worth offering on THIS machine, in megabytes.
+
+    These used to be a fixed 2/3/4/5 GB ladder, which described exactly one
+    card. On a 24 GB desktop card it capped every option far below what was
+    available; on a 4 GB laptop card every entry but the first asked for more
+    memory than existed.
+
+    The ladder is therefore built from what was detected: a low cap that
+    leaves the machine usable, a couple of steps, and the whole card. The
+    system-memory entry is a deliberate escape hatch — it lets the driver
+    spill into RAM so a model whose weights exceed the card can run at all,
+    which is much slower and so is never automatic.
+    """
+    spill = max(8192, int(ram_bytes / 1024 ** 2 / 2)) if ram_bytes else SYSTEM_MEMORY_MB
+    choices: list[tuple[str, int | None]] = [("Automatic", None)]
+
+    total = int(vram_bytes / 1024 ** 2)
+    if total < 1024:
+        # No card detected, or one too small to divide up sensibly.
+        return choices + [
+            ("Use system memory — for oversized models (slow)", spill)
+        ]
+
+    steps = sorted({
+        max(1024, total // 4),
+        max(1536, total // 2),
+        max(2048, total * 3 // 4),
+        total,
+    })
+    for value in steps:
+        if value >= total:
+            choices.append((f"{total / 1024:.0f} GB — the whole card", total))
+        elif value <= total // 4:
+            choices.append((f"{value / 1024:.1f} GB — leave the machine free", value))
+        else:
+            choices.append((f"{value / 1024:.1f} GB", value))
+    choices.append(("Use system memory — for oversized models (slow)", spill))
+    return choices
+
+
+# Filled in from the detected hardware when the window opens; the module-level
+# default keeps anything importing this list working without a GPU present.
+VRAM_CHOICES = vram_choices()
 
 
 class Worker(QObject):
@@ -412,6 +448,21 @@ class MainWindow(QMainWindow):
         self.play_timer.timeout.connect(self._tick)
         self.theme_mode = theme.load_mode()
 
+        # Detected once, before anything is built: the memory ladder, the
+        # encoder and the speed estimates all depend on what this machine
+        # actually is. Encoder probing is skipped here because it costs a
+        # real encode per candidate; the first render resolves it instead.
+        from .system import Hardware, detect
+
+        try:
+            self.hardware = detect(probe_encoders=False)
+        except Exception:  # noqa: BLE001 - never block startup on detection
+            self.hardware = Hardware(
+                os_name="", machine="", cpu_name="", cpu_cores=0, ram_bytes=0,
+                accelerator="cpu", gpu_name="", vram_bytes=0,
+                encoder="libx265", encoder_is_hardware=False,
+            )
+
         # The picture takes the main area; the controls sit beside it.
         #
         # Everything the theme aims at — restraint, no colour for its own sake,
@@ -461,6 +512,10 @@ class MainWindow(QMainWindow):
         self._watch_settings()
         self._update_forecast()
 
+        # After the window is up, so the warning appears over a real window
+        # rather than delaying one from ever showing.
+        QTimer.singleShot(200, self._warn_if_unusable)
+
         quit_action = QAction("Quit", self)
         quit_action.setShortcut("Ctrl+Q")
         quit_action.triggered.connect(self.close)
@@ -484,6 +539,11 @@ class MainWindow(QMainWindow):
         self.theme_button.clicked.connect(self._toggle_theme)
         self._sync_theme_button()
         row.addWidget(self.theme_button)
+
+        self.system_button = QPushButton("System")
+        self.system_button.setToolTip(HELP["system_button"])
+        self.system_button.clicked.connect(self._open_requirements)
+        row.addWidget(self.system_button)
 
         self.guide_button = QPushButton("Guide")
         self.guide_button.setToolTip(HELP["guide_button"])
@@ -836,7 +896,7 @@ class MainWindow(QMainWindow):
         f.addRow(field_label("Segment frames"), with_help(self.segment_frames, "segment_frames"))
 
         self.vram_budget = QComboBox()
-        for label, mb in VRAM_CHOICES:
+        for label, mb in vram_choices(self.hardware.vram_bytes, self.hardware.ram_bytes):
             self.vram_budget.addItem(label, mb)
         self.vram_budget.setItemData(
             0, "Use whatever is free, leaving room for the desktop.", Qt.ToolTipRole)
@@ -915,6 +975,101 @@ class MainWindow(QMainWindow):
             body = MODEL_NOTES[name].replace("\n\n", "<br>").replace("\n", "<br>")
             parts.append(f"<p><b>{name}</b><br>{body}</p>")
         return "".join(parts)
+
+    def _requirements_html(self) -> str:
+        """What this machine has, what it is missing, and how to fix it."""
+        from .preflight import check_all
+        from .system import describe
+
+        output = self.output_label.text() if hasattr(self, "output_label") else ""
+        palette = theme.resolve(QApplication.instance(), self.theme_mode)
+        rows = []
+        for r in check_all("models/custom", output if not output.startswith("(") else None):
+            if r.ok:
+                mark, colour = "Ready", palette.success
+            elif r.essential:
+                mark, colour = "Missing", palette.danger
+            else:
+                mark, colour = "Optional", palette.text_muted
+            fix = ""
+            if not r.ok and r.fix:
+                escaped = r.fix.replace("&", "&amp;").replace("<", "&lt;")
+                fix = (f"<div style='color:{palette.text_muted};margin:4px 0 0 0'>"
+                       f"{escaped.replace(chr(10), '<br>')}</div>")
+            rows.append(
+                f"<p><b style='color:{colour}'>{mark}</b> &nbsp; <b>{r.name}</b>"
+                f"<br><span style='color:{palette.text_muted}'>{r.detail}</span>"
+                f"{fix}</p>"
+            )
+
+        try:
+            facts = describe(self.hardware).replace(chr(10), "<br>")
+        except Exception:  # noqa: BLE001
+            facts = ""
+
+        return (
+            f"<h2>This machine</h2>"
+            f"<pre style='color:{palette.text_muted}'>{facts}</pre>"
+            f"<h2>Requirements</h2>{''.join(rows)}"
+        )
+
+    def _open_requirements(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("System and requirements")
+        dialog.resize(680, 560)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(theme.GAP_WIDE, theme.GAP_WIDE,
+                                  theme.GAP_WIDE, theme.GAP_WIDE)
+        layout.setSpacing(theme.GAP)
+
+        view = QTextBrowser()
+        view.setOpenExternalLinks(True)
+        view.setHtml(self._requirements_html())
+        layout.addWidget(view, 1)
+
+        row = QHBoxLayout()
+        recheck = QPushButton("Check again")
+        recheck.setToolTip("Re-run every check, after installing something.")
+        recheck.clicked.connect(lambda: view.setHtml(self._requirements_html()))
+        row.addWidget(recheck)
+        row.addStretch(1)
+        close = QPushButton("Close")
+        close.setObjectName("primary")
+        close.clicked.connect(dialog.accept)
+        row.addWidget(close)
+        layout.addLayout(row)
+        dialog.exec()
+
+    def _warn_if_unusable(self) -> None:
+        """Say so at startup when a render could not possibly run.
+
+        Silence here means the user picks a file, presses Render and gets a
+        traceback about a missing executable. Better to say it plainly while
+        nothing is at stake.
+        """
+        from .preflight import blocking, check_all
+
+        try:
+            stoppers = blocking(check_all("models/custom"))
+        except Exception:  # noqa: BLE001 - a check that crashes helps nobody
+            return
+        if not stoppers:
+            return
+
+        names = ", ".join(r.name for r in stoppers)
+        self._append(f"Not ready to render: {names}.")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Something is missing")
+        box.setText(f"This machine cannot render yet: {names}.")
+        box.setInformativeText(
+            "Open System for what each one is and the command that installs it."
+        )
+        show = box.addButton("Open System", QMessageBox.AcceptRole)
+        box.addButton("Continue anyway", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is show:
+            self._open_requirements()
 
     def _open_guide(self) -> None:
         dialog = QDialog(self)

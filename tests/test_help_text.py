@@ -16,7 +16,7 @@ REQUIRED_KEYS = [
     "preview_button", "render_button", "cancel_button", "progress",
     "queue", "queue_start", "queue_stop", "queue_remove", "queue_clear",
     "forecast",
-    "guide_button",
+    "guide_button", "system_button",
     "compare_button", "compare_time", "compare_mode", "compare_zoom",
     "play_button", "compare_with", "position", "loop",
     "theme_toggle",
@@ -42,6 +42,7 @@ NEEDS_DETAIL = [
 
 # Plain actions: complete in a line or two, and padding them would be worse.
 SIMPLE = ["rescan", "guide_button", "cancel_button", "queue_start", "queue_clear",
+          "system_button",
           "theme_toggle"]
 
 
